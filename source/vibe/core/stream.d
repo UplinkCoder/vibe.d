@@ -161,6 +161,9 @@ interface ConnectionStream : Stream {
 		Note that close must always be called, even if the remote has already
 		closed the connection. Failure to do so will result in resource and
 		memory leakage.
+
+		Closing a connection implies a call to finalize, so that it doesn't
+		need to be called explicitly (it will be a no-op in that case).
 	*/
 	void close();
 
@@ -196,7 +199,7 @@ interface RandomAccessStream : Stream {
 	Any data written to the stream will be ignored and discarded. This stream type is useful if
 	the output of a particular stream is not needed but the stream needs to be drained.
 */
-class NullOutputStream : OutputStream {
+final class NullOutputStream : OutputStream {
 	void write(in ubyte[] bytes) {}
 	void write(InputStream stream, ulong nbytes = 0)
 	{

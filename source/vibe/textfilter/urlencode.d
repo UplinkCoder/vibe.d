@@ -19,7 +19,7 @@ import std.format;
 /** Returns the URL encoded version of a given string.
 */
 string urlEncode(string str, string allowed_chars = null)
-{
+@safe {
 	auto dst = appender!string();
 	dst.reserve(str.length);
 	filterURLEncode(dst, str, allowed_chars);
@@ -29,7 +29,7 @@ string urlEncode(string str, string allowed_chars = null)
 /** Returns the decoded version of a given URL encoded string.
 */
 string urlDecode(string str)
-{
+@safe {
 	if (!str.anyOf("%")) return str;
 	auto dst = appender!string();
 	dst.reserve(str.length);
@@ -46,7 +46,7 @@ string urlDecode(string str)
 	according to the HTTP standard.
 */
 string formEncode(string str, string allowed_chars = null)
-{
+@safe {
 	auto dst = appender!string();
 	dst.reserve(str.length);
 	filterURLEncode(dst, str, allowed_chars, true);
@@ -59,7 +59,7 @@ string formEncode(string str, string allowed_chars = null)
 	spaces are replaced by plus characters.
 */
 string formDecode(string str)
-{
+@safe {
 	if (!str.anyOf("%+")) return str;
 	auto dst = appender!string();
 	dst.reserve(str.length);
@@ -79,9 +79,9 @@ void filterURLEncode(R)(ref R dst, string str, string allowed_chars = null, bool
 					break;
 				}
 				goto default;
-			case 'A': .. case 'Z'+1:
-			case 'a': .. case 'z'+1:
-			case '0': .. case '9'+1:
+			case 'A': .. case 'Z':
+			case 'a': .. case 'z':
+			case '0': .. case '9':
 			case '-': case '_': case '.': case '~':
 				dst.put(str[0]);
 				break;
@@ -92,9 +92,6 @@ void filterURLEncode(R)(ref R dst, string str, string allowed_chars = null, bool
 		str = str[1 .. $];
 	}
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use filterURLEncode instead.") alias filterUrlEncode = filterURLEncode;
 
 
 /** Writes the decoded version of the given URL encoded string to an output range.
@@ -126,15 +123,13 @@ void filterURLDecode(R)(ref R dst, string str, bool form_encoding = false)
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use filterURLDecode instead.") alias filterUrlDecode = filterURLDecode;
 
-
-unittest
+@safe unittest
 {
 	assert(urlEncode("\r\n") == "%0D%0A"); // github #65
 	assert(urlEncode("This-is~a_test") == "This-is~a_test");
 	assert(urlEncode("This is a test") == "This%20is%20a%20test");
+	assert(urlEncode("This{is}test") == "This%7Bis%7Dtest", urlEncode("This{is}test"));
 	assert(formEncode("This is a test") == "This+is+a+test");
 	assert(formEncode("this/test", "/") == "this/test");
 	assert(formEncode("this/test") == "this%2Ftest");

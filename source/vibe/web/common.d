@@ -8,6 +8,10 @@
 module vibe.web.common;
 
 import vibe.http.common;
+import vibe.data.json;
+
+static import std.utf;
+static import std.string;
 
 
 /**
@@ -121,7 +125,7 @@ unittest
 /**
 	User Defined Attribute interface to force specific HTTP method in REST interface
 	for function in question. Usual URL generation rules are still applied so if there
-	are ny "get", "query" or similar prefixes, they are filtered out.
+	are any "get", "query" or similar prefixes, they are filtered out.
 
 	Example:
 	---
@@ -132,11 +136,11 @@ unittest
 	}
 	---	
  */
-OverridenMethod method(HTTPMethod data)
+MethodAttribute method(HTTPMethod data)
 {
 	if (!__ctfe)
 		assert(false);
-	return OverridenMethod(data);
+	return MethodAttribute(data);
 }
 
 /**
@@ -159,11 +163,11 @@ OverridenMethod method(HTTPMethod data)
 	}
 	---	
 */
-OverridenPath path(string data)
+PathAttribute path(string data)
 {
 	if (!__ctfe)
 		assert(false);
-	return OverridenPath(data);
+	return PathAttribute(data);
 }
 
 
@@ -171,9 +175,9 @@ OverridenPath path(string data)
 	UDA to define root URL prefix for annotated REST interface.
 	Empty path means deducing prefix from interface type name (see also rootPathFromName)
  */
-RootPath rootPath(string path)
+RootPathAttribute rootPath(string path)
 {
-	return RootPath(path);
+	return RootPathAttribute(path);
 }
 ///
 unittest
@@ -199,16 +203,16 @@ unittest
 	registerRestInterface(router, new API());
 	auto routes= router.getAllRoutes();
 
-	assert(routes[HTTPMethod.GET][0].pattern == "/oops/foo");
+	assert(routes[0].pattern == "/oops/foo" && routes[0].method == HTTPMethod.GET);
 }
 
 
 /**
 	Convenience alias
  */
-@property RootPath rootPathFromName()
+@property RootPathAttribute rootPathFromName()
 {
-	return RootPath("");
+	return RootPathAttribute("");
 }
 ///
 unittest
@@ -234,30 +238,39 @@ unittest
 	registerRestInterface(router, new API());
 	auto routes= router.getAllRoutes();
 
-	assert(routes[HTTPMethod.GET][0].pattern == "/iapi/foo");
+	assert(routes[0].pattern == "/iapi/foo" && routes[0].method == HTTPMethod.GET);
 }
 
 
 /// private
-struct OverridenMethod
+struct MethodAttribute
 {
 	HTTPMethod data;
 	alias data this;
 }
 
 /// private
-struct OverridenPath
+deprecated alias OverriddenMethod = MethodAttribute;
+
+/// private
+struct PathAttribute
 {
 	string data;
 	alias data this;
 }
 
 /// private
-struct RootPath
+deprecated alias OverriddenPath = PathAttribute;
+
+/// private
+struct RootPathAttribute
 {
 	string data;
 	alias data this;
 }
+
+/// private
+deprecated alias RootPath = RootPathAttribute;
 
 
 /**
@@ -344,8 +357,8 @@ auto extractHTTPMethodAndName(alias Func)()
 	// Cases may conflict and are listed in order of priority
 
 	// Workaround for Nullable incompetence
-	enum uda1 = findFirstUDA!(vibe.http.rest.OverridenMethod, Func);
-	enum uda2 = findFirstUDA!(vibe.http.rest.OverridenPath, Func);
+	enum uda1 = findFirstUDA!(MethodAttribute, Func);
+	enum uda2 = findFirstUDA!(PathAttribute, Func);
 
 	static if (uda1.found) {
 		udmethod = uda1.value;
@@ -466,4 +479,29 @@ unittest {
 	assert(concatURL("/test", "it", true) == "/test/it/");
 	assert(concatURL("/test", "", true) == "/test/");
 	assert(concatURL("/test/", "", true) == "/test/");
+}
+
+/** 
+ 	Respresents a Rest error response
+*/
+class RestException : HTTPStatusException {
+	private {
+		Json m_jsonResult;
+	}
+	
+	///
+	this(int status, Json jsonResult, string file = __FILE__, int line = __LINE__, Throwable next = null)
+	{
+		if (jsonResult.type == Json.Type.Object && jsonResult.statusMessage.type == Json.Type.String) {
+			super(status, jsonResult.statusMessage.get!string, file, line, next);
+		}
+		else {
+			super(status, httpStatusText(status) ~ " (" ~ jsonResult.toString() ~ ")", file, line, next);
+		}
+		
+		m_jsonResult = jsonResult;
+	}
+	
+	/// The HTTP status code
+	@property const(Json) jsonResult() const { return m_jsonResult; }
 }

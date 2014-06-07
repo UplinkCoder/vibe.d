@@ -1,7 +1,7 @@
 /**
 	libev based driver implementation
 
-	Copyright: © 2012 RejectedSoftware e.K.
+	Copyright: © 2012-2014 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
@@ -47,7 +47,7 @@ private extern(C){
 	void* myrealloc(void* p, sizediff_t newsize){ return GC.realloc(p, newsize); }
 }
 
-class LibevDriver : EventDriver {
+final class LibevDriver : EventDriver {
 	private {
 		DriverCore m_core;
 		ev_loop_t* m_loop;
@@ -92,7 +92,6 @@ class LibevDriver : EventDriver {
 	bool processEvents()
 	{
 		ev_run(m_loop, EVRUN_NOWAIT);
-		m_core.notifyIdle();
 		if (m_break) {
 			m_break = false;
 			return false;
@@ -107,7 +106,7 @@ class LibevDriver : EventDriver {
 		ev_break(m_loop, EVBREAK_ALL);
 	}
 	
-	FileStream openFile(Path path, FileMode mode)
+	ThreadedFileStream openFile(Path path, FileMode mode)
 	{
 		return new ThreadedFileStream(path, mode);
 	}
@@ -147,7 +146,7 @@ class LibevDriver : EventDriver {
 			ret = inet_pton(AF_INET, toStringz(address), &addr_ip4.sin_addr);
 		}
 		if( ret == 1 ){
-			auto rc = listenTCPGeneric(AF_INET, &addr_ip4, port, conn_callback);
+			auto rc = listenTCPGeneric(AF_INET, &addr_ip4, port, conn_callback, options);
 			logInfo("Listening on %s port %d %s", address, port, (rc?"succeeded":"failed"));
 			return rc;
 		}
@@ -159,7 +158,7 @@ class LibevDriver : EventDriver {
 			addr_ip6.sin6_port = htons(port);
 			ret = inet_pton(AF_INET6, toStringz(address), &addr_ip6.sin6_addr);
 			if( ret == 1 ){
-				auto rc = listenTCPGeneric(AF_INET6, &addr_ip6, port, conn_callback);
+				auto rc = listenTCPGeneric(AF_INET6, &addr_ip6, port, conn_callback, options);
 				logInfo("Listening on %s port %d %s", address, port, (rc?"succeeded":"failed"));
 				return rc;
 			}
@@ -179,9 +178,44 @@ class LibevDriver : EventDriver {
 		return new LibevManualEvent;
 	}
 
-	LibevTimer createTimer(void delegate() callback)
+	FileDescriptorEvent createFileDescriptorEvent(int file_descriptor, FileDescriptorEvent.Trigger triggers)
 	{
-		return new LibevTimer(this, callback);
+		assert(false);
+	}
+
+	size_t createTimer(void delegate() callback)
+	{
+		assert(false);
+	}
+
+	void acquireTimer(size_t timer_id)
+	{
+		assert(false);
+	}
+
+	void releaseTimer(size_t timer_id)
+	{
+		assert(false);
+	}
+
+	bool isTimerPending(size_t timer_id)
+	{
+		assert(false);
+	}
+
+	void rearmTimer(size_t timer_id, Duration dur, bool periodic)
+	{
+		assert(false);
+	}
+
+	void stopTimer(size_t timer_id)
+	{
+		assert(false);
+	}
+
+	void waitTimer(size_t timer_id)
+	{
+		assert(false);
 	}
 
 	private LibevTCPListener listenTCPGeneric(SOCKADDR)(int af, SOCKADDR* sock_addr, ushort port, void delegate(TCPConnection conn) connection_callback)
@@ -216,12 +250,14 @@ sockaddr*)sock_addr, SOCKADDR.sizeof) ){
 		w_accept.data = cast(void*)this;
 		//addEventReceiver(m_core, listenfd, new LibevTCPListener(connection_callback));
 
-		return new LibevTCPListener(this, listenfd, w_accept, connection_callback);
+		// TODO: support TCPListenOptions.distribute
+
+		return new LibevTCPListener(this, listenfd, w_accept, connection_callback, options);
 	}
 }
 
 
-class LibevManualEvent : ManualEvent {
+final class LibevManualEvent : ManualEvent {
 	private {
 		struct ThreadSlot {
 			LibevDriver driver;
@@ -264,7 +300,6 @@ class LibevManualEvent : ManualEvent {
 	int wait(int reference_emit_count)
 	{
 		assert(!amOwner());
-		auto self = Fiber.getThis();
 		acquire();
 		scope(exit) release();
 		auto ec = this.emitCount;
@@ -344,7 +379,7 @@ class LibevManualEvent : ManualEvent {
 }
 
 
-class LibevTimer : Timer {
+/*class LibevTimer : Timer {
 	mixin SingleOwnerEventedObject;
 	
 	private {
@@ -398,30 +433,32 @@ class LibevTimer : Timer {
 		try {
 			if( tm.m_owner && tm.m_owner.running ) tm.m_driver.m_core.resumeTask(tm.m_owner);
 			if( tm.m_callback ) runTask(tm.m_callback);
-		} catch (Throwable e) {
+		} catch (UncaughtException e) {
 			logError("Exception while handling timer event: %s", e.msg);
 			try logDebug("Full exception: %s", sanitize(e.toString())); catch {}
 			debug assert(false);
 		}
 	}
-}
+}*/
 
 
-class LibevTCPListener : TCPListener {
+final class LibevTCPListener : TCPListener {
 	private {
 		LibevDriver m_driver;
 		int m_socket;
 		ev_io* m_io;
 		void delegate(TCPConnection conn) m_connectionCallback;
+		TCPListenOptions m_options;
 	}
 
-	this(LibevDriver driver, int sock, ev_io* io, void delegate(TCPConnection conn) connection_callback)
+	this(LibevDriver driver, int sock, ev_io* io, void delegate(TCPConnection conn) connection_callback, TCPListenOptions options)
 	{
 		m_driver = driver;
 		m_socket = sock;
 		m_io = io;
 		m_connectionCallback = connection_callback;
 		m_io.data = cast(void*)this;
+		m_options = options;
 	}
 	
 	@property void delegate(TCPConnection conn) connectionCallback() { return m_connectionCallback; }
@@ -432,7 +469,7 @@ class LibevTCPListener : TCPListener {
 	}
 }
 
-class LibevTCPConnection : TCPConnection {
+final class LibevTCPConnection : TCPConnection {
 	mixin SingleOwnerEventedObject;
 
 	private {
@@ -481,6 +518,14 @@ class LibevTCPConnection : TCPConnection {
 	}
 	@property Duration readTimeout() const { return m_readTimeout; }
 	
+	@property void keepAlive(bool enabled)
+	{
+		m_keepAlive = enabled;
+		ubyte opt = enabled;
+		setsockopt(m_socket, SOL_SOCKET, SO_KEEPALIVE, &opt, opt.sizeof);
+	}
+	@property bool keepAlive() const { return m_keepAlive; }
+
 	@property bool connected() const { return m_socket >= 0; }
 	
 	@property bool dataAvailableForRead(){ return m_readBufferContent.length > 0; }
@@ -533,11 +578,12 @@ class LibevTCPConnection : TCPConnection {
 		
 		logTrace("wait for data");
 		
-		auto timer = scoped!LibevTimer(m_driver, cast(void delegate())null);
-		timer.acquire();
-		scope(exit) timer.release();
+		auto timer = m_driver.createTimer(null);
+		scope (exit) m_driver.releaseTimer(timer);
+//		m_driver.m_timers[timer].owner = Task.getThis();
 		if (timeout > 0.seconds())
-			timer.rearm(timeout);
+			m_driver.rearmTimer(timer, timeout, false);
+
 		yieldFor(EV_READ);
 		return readChunk(true);
 	}
@@ -701,9 +747,10 @@ private extern(C){
 				obj.m_connectionCallback(conn);
 			} catch( Exception e ){
 				logWarn("Unhandled exception in connection handler: %s", e.toString());
+			} finally {
+				logTrace("client task out");
+				if (conn.connected && !(obj.m_options & TCPListenOptions.disableAutoClose)) conn.close();
 			}
-			logTrace("client task out");
-			if( conn.connected ) conn.close();
 		}
 		
 		runTask(&client_task);

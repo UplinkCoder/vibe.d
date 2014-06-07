@@ -34,7 +34,6 @@ struct Path {
 		m_nodes = cast(immutable)splitPath(pathstr);
 		m_absolute = (pathstr.startsWith("/") || m_nodes.length > 0 && (m_nodes[0].toString().canFind(':') || m_nodes[0] == "\\"));
 		m_endsWithSlash = pathstr.endsWith("/");
-		foreach( e; m_nodes ) assert(e.toString().length > 0, "Empty path nodes not allowed: "~pathstr);
 	}
 	
 	/// Constructs a path object from a list of PathEntry objects.
@@ -62,7 +61,7 @@ struct Path {
 				default:
 					newnodes ~= n;
 					break;
-				case ".": break;
+				case "", ".": break;
 				case "..":
 					enforce(!m_absolute || newnodes.length > 0, "Path goes below root node.");
 					if( newnodes.length > 0 && newnodes[$-1] != ".." ) newnodes = newnodes[0 .. $-1];
@@ -128,6 +127,16 @@ struct Path {
 	
 	/// Computes the relative path from `parentPath` to this path.
 	Path relativeTo(const Path parentPath) const {
+		assert(this.absolute && parentPath.absolute);
+		version(Windows){
+			// a path such as ..\C:\windows is not valid, so force the path to stay absolute in this case
+			if( this.absolute && !this.empty &&
+				(m_nodes[0].toString().endsWith(":") && !parentPath.startsWith(this[0 .. 1]) ||
+				m_nodes[0] == "\\" && !parentPath.startsWith(this[0 .. min(2, $)])))
+			{
+				return this;
+			}
+		}
 		int nup = 0;
 		while( parentPath.length > nup && !startsWith(parentPath[0 .. parentPath.length-nup]) ){
 			nup++;
@@ -136,6 +145,7 @@ struct Path {
 		ret.m_endsWithSlash = true;
 		foreach( i; 0 .. nup ) ret ~= "..";
 		ret ~= Path(m_nodes[parentPath.length-nup .. $], false);
+		ret.m_endsWithSlash = this.m_endsWithSlash;
 		return ret;
 	}
 	
@@ -182,11 +192,10 @@ struct Path {
 		ret.m_endsWithSlash = rhs.m_endsWithSlash;
 		ret.normalize(); // needed to avoid "."~".." become "" instead of ".."
 		
-		size_t idx = m_nodes.length;
-		foreach(folder; rhs.m_nodes){
-			switch(folder.toString()){
+		foreach (folder; rhs.m_nodes) {
+			switch (folder.toString()) {
 				default: ret.m_nodes = ret.m_nodes ~ folder; break;
-				case ".": break;
+				case "", ".": break;
 				case "..":
 					enforce(!ret.absolute || ret.m_nodes.length > 0, "Relative path goes below root node!");
 					if( ret.m_nodes.length > 0 && ret.m_nodes[$-1].toString() != ".." )
@@ -234,6 +243,17 @@ struct Path {
 		if( m_nodes.length < rhs.m_nodes.length ) return -1;
 		return 0;
 	}
+
+	hash_t toHash()
+	const nothrow @trusted {
+		hash_t ret;
+		auto strhash = &typeid(string).getHash;
+		try foreach (n; nodes) ret ^= strhash(&n.m_name);
+		catch assert(false);
+		if (m_absolute) ret ^= 0xfe3c1738;
+		if (m_endsWithSlash) ret ^= 0x6aa4352d;
+		return ret;
+	}
 }
 
 
@@ -242,6 +262,7 @@ unittest
 	{
 		auto unc = "\\\\server\\share\\path";
 		auto uncp = Path(unc);
+		uncp.normalize();
 		version(Windows) assert(uncp.toNativeString() == unc);
 		assert(uncp.absolute);
 		assert(!uncp.endsWithSlash);
@@ -292,6 +313,44 @@ unittest
 		assert(dotpathp.toString() == "/test/../test2/././x/y");
 		dotpathp.normalize();
 		assert(dotpathp.toString() == "/test2/x/y");
+	}
+
+	{
+		auto dotpath = "/test/..////test2//./x/y";
+		auto dotpathp = Path(dotpath);
+		assert(dotpathp.toString() == "/test/..////test2//./x/y");
+		dotpathp.normalize();
+		assert(dotpathp.toString() == "/test2/x/y");
+	}
+	
+	{
+		auto parentpath = "/path/to/parent";
+		auto parentpathp = Path(parentpath);
+		auto subpath = "/path/to/parent/sub/";
+		auto subpathp = Path(subpath);
+		auto subpath_rel = "sub/";
+		assert(subpathp.relativeTo(parentpathp).toString() == subpath_rel);
+		auto subfile = "/path/to/parent/child";
+		auto subfilep = Path(subfile);
+		auto subfile_rel = "child";
+		assert(subfilep.relativeTo(parentpathp).toString() == subfile_rel);
+	}
+
+	{ // relative paths across Windows devices are not allowed
+		version (Windows) {
+			auto p1 = Path("\\\\server\\share"); assert(p1.absolute);
+			auto p2 = Path("\\\\server\\othershare"); assert(p2.absolute);
+			auto p3 = Path("\\\\otherserver\\share"); assert(p3.absolute);
+			auto p4 = Path("C:\\somepath"); assert(p4.absolute);
+			auto p5 = Path("C:\\someotherpath"); assert(p5.absolute);
+			auto p6 = Path("D:\\somepath"); assert(p6.absolute);
+			assert(p4.relativeTo(p5) == Path("../somepath"));
+			assert(p4.relativeTo(p6) == Path("C:\\somepath"));
+			assert(p4.relativeTo(p1) == Path("C:\\somepath"));
+			assert(p1.relativeTo(p2) == Path("../share"));
+			assert(p1.relativeTo(p3) == Path("\\\\server\\share"));
+			assert(p1.relativeTo(p4) == Path("\\\\server\\share"));
+		}
 	}
 }
 
@@ -368,12 +427,10 @@ PathEntry[] splitPath(string path)
 	// read and return the elements
 	foreach( i, char ch; path )
 		if( ch == '\\' || ch == '/' ){
-			enforce(i - startidx > 0, "Empty path entries not allowed.");
 			storage[eidx++] = PathEntry(path[startidx .. i]);
 			startidx = i+1;
 		}
 	storage[eidx++] = PathEntry(path[startidx .. $]);
-	enforce(path.length - startidx > 0, "Empty path entries not allowed.");
 	assert(eidx == nelements);
 	return storage;
 }

@@ -82,9 +82,11 @@ struct Bson {
 	/// Returns a new, empty Bson value of type Object.
 	static @property Bson emptyArray() { return Bson(cast(Bson[])null); }
 
-	/// Compatibility alias - will be deprecated soon.
+	/// Deprecated compatibility alias.
+	deprecated("Please use emptyObject instead.")
 	alias EmptyObject = emptyObject;
-	/// Compatibility alias - will be deprecated soon.
+	/// Deprecated compatibility alias.
+	deprecated("Please use emptyArray instead.")
 	alias EmptyArray = emptyArray;
 
 	private {
@@ -347,7 +349,7 @@ struct Bson {
 			while( d.length > 0 ){
 				auto tp = cast(Type)d[0];
 				if( tp == Type.end ) break;
-				auto key = skipCString(d); // should be '0', '1', ...
+				/*auto key = */skipCString(d); // should be '0', '1', ...
 				auto value = Bson(tp, d);
 				d = d[value.data.length .. $];
 
@@ -455,7 +457,7 @@ struct Bson {
 	/** Returns a string representation of this BSON value in JSON format.
 	*/
 	string toString()
-	{
+	const {
 		return toJson().toString();
 	}
 
@@ -924,12 +926,12 @@ struct BsonRegex {
 	The methods will have to be defined in pairs. The first pair that is implemented by
 	the type will be used for serialization (i.e. toBson overrides toJson).
 */
-Bson serializeToBson(T)(T value)
+Bson serializeToBson(T)(T value, ubyte[] buffer = null)
 {
 	version (VibeOldSerialization) {
 		return serializeToBsonOld(value);
 	} else {
-		return serialize!BsonSerializer(value);
+		return serialize!BsonSerializer(value, buffer);
 	}
 }
 
@@ -1057,7 +1059,7 @@ T deserializeBsonOld(T)(Bson src)
 		foreach (string key, value; src) {
 			static if (is(TK == string)) {
 				dst[key] = deserializeBson!(Unqual!TV)(value);
-			} else static if (is(TK == enum)) { 
+			} else static if (is(TK == enum)) {
 				dst[to!(TK)(key)] = deserializeBson!(Unqual!TV)(value);
 			} else static if (isStringSerializable!TK) {
 				auto dsk = TK.fromString(key);
@@ -1125,6 +1127,12 @@ unittest {
 	assert(t.l == u.l);
 }
 
+unittest
+{
+    assert(uint.max == serializeToBson(uint.max).deserializeBson!uint);
+    assert(ulong.max == serializeToBson(ulong.max).deserializeBson!ulong);
+}
+
 unittest {
 	assert(deserializeBson!SysTime(serializeToBson(SysTime(0))) == SysTime(0));
 	assert(deserializeBson!SysTime(serializeToBson(SysTime(0, UTC()))) == SysTime(0, UTC()));
@@ -1151,11 +1159,18 @@ unittest {
 	assert(serializeToBson(const C(123)) == Bson("123"));
 	assert(serializeToBson(C(123))       == Bson("123"));
 
-	static struct D { int value; string toString() { return ""; } }
+	static struct D { int value; string toString() const { return ""; } }
 	static assert(!isStringSerializable!D && !isJsonSerializable!D && !isBsonSerializable!D);
 	static assert(!isStringSerializable!(const(D)) && !isJsonSerializable!(const(D)) && !isBsonSerializable!(const(D)));
 	assert(serializeToBson(const D(123)) == serializeToBson(["value": 123]));
 	assert(serializeToBson(D(123))       == serializeToBson(["value": 123]));
+
+	// test if const(class) is serializable
+	static class E { int value; this(int v) { value = v; } static E fromBson(Bson val) { return new E(val.get!int); } Bson toBson() const { return Bson(value); } Json toJson() { return Json(); } }
+	static assert(!isStringSerializable!E && !isJsonSerializable!E && isBsonSerializable!E);
+	static assert(!isStringSerializable!(const(E)) && !isJsonSerializable!(const(E)) && !isBsonSerializable!(const(E)));
+	assert(serializeToBson(new const E(123)) == Bson(123));
+	assert(serializeToBson(new E(123))       == Bson(123));
 }
 
 unittest {
@@ -1186,6 +1201,11 @@ unittest {
 	deserializeBson(d, serializeToBson(c));
 	assert(c.a == d.a);
 	assert(c.b == d.b);
+
+	const(C) e = c; // serialize const class instances (issue #653)
+	deserializeBson(d, serializeToBson(e));
+	assert(e.a == d.a);
+	assert(e.b == d.b);
 }
 
 unittest {
@@ -1223,6 +1243,12 @@ unittest {
 	}
 }
 
+unittest {
+	ubyte[] data = [1, 2, 3];
+	auto bson = serializeToBson(data);
+	assert(bson.type == Bson.Type.binData);
+	assert(deserializeBson!(ubyte[])(bson) == data);
+}
 
 
 /**
@@ -1231,8 +1257,10 @@ unittest {
 	See_Also: vibe.data.serialization.serialize, vibe.data.serialization.deserialize, serializeToBson, deserializeBson
 */
 struct BsonSerializer {
+	import vibe.utils.array : AllocAppender;
+
 	private {
-		Appender!(ubyte[]) m_dst;
+		AllocAppender!(ubyte[]) m_dst;
 		size_t[] m_compositeStack;
 		Bson.Type m_type = Bson.Type.null_;
 		Bson m_inputData;
@@ -1245,6 +1273,12 @@ struct BsonSerializer {
 		m_inputData = input;
 	}
 
+	this(ubyte[] buffer)
+	{
+		import vibe.utils.memory;
+		m_dst = AllocAppender!(ubyte[])(defaultAllocator(), buffer);
+	}
+
 	@disable this(this);
 
 	template isSupportedValueType(T) { enum isSupportedValueType = is(typeof(getBsonTypeID(T.init))); }
@@ -1255,7 +1289,7 @@ struct BsonSerializer {
 	Bson getSerializedResult()
 	{
 		auto ret = Bson(m_type, cast(immutable)m_dst.data);
-		m_dst = appender!(ubyte[]);
+		m_dst.reset();
 		m_type = Bson.Type.null_;
 		return ret;
 	}
@@ -1286,9 +1320,13 @@ struct BsonSerializer {
 	void beginWriteArrayEntry(T)(size_t idx) { m_entryIndex = idx; }
 	void endWriteArrayEntry(T)(size_t idx) {}
 
-	void writeValue(T)(T value)
+	// auto ref does't work for DMD 2.064
+	void writeValue(T)(/*auto ref const*/ in T value) { writeValueH!(T, true)(value); }
+	
+	private void writeValueH(T, bool write_header)(/*auto ref const*/ in T value)
 	{
-		writeCompositeEntryHeader(getBsonTypeID(value));
+		static if (write_header) writeCompositeEntryHeader(getBsonTypeID(value));
+
 		static if (is(T == Bson)) { m_dst.put(value.data); }
 		else static if (is(T == Json)) { m_dst.put(Bson(value).data); } // FIXME: use .writeBsonValue
 		else static if (is(T == typeof(null))) {}
@@ -1296,6 +1334,7 @@ struct BsonSerializer {
 		else static if (is(T == BsonBinData)) { m_dst.put(toBsonData(cast(int)value.rawData.length)); m_dst.put(value.type); m_dst.put(value.rawData); }
 		else static if (is(T == BsonObjectID)) { m_dst.put(value.m_bytes[]); }
 		else static if (is(T == BsonDate)) { m_dst.put(toBsonData(value.m_time)); }
+		else static if (is(T == SysTime)) { m_dst.put(toBsonData(BsonDate(value).m_time)); }
 		else static if (is(T == BsonRegex)) { m_dst.putCString(value.expression); m_dst.putCString(value.options); }
 		else static if (is(T == BsonTimestamp)) { m_dst.put(toBsonData(value.m_time)); }
 		else static if (is(T == bool)) { m_dst.put(cast(ubyte)(value ? 0x01 : 0x00)); }
@@ -1304,7 +1343,7 @@ struct BsonSerializer {
 		else static if (is(T : double)) { m_dst.put(toBsonData(cast(double)value)); }
 		else static if (isBsonSerializable!T) m_dst.put(value.toBson().data);
 		else static if (isJsonSerializable!T) m_dst.put(Bson(value.toJson()).data);
-		else static if (is(T : const(ubyte)[])) { writeValue(BsonBinData(BsonBinData.Type.generic, value.idup)); }
+		else static if (is(T : const(ubyte)[])) { writeValueH!(BsonBinData, false)(BsonBinData(BsonBinData.Type.generic, value.idup)); }
 		else static assert(false, "Unsupported type: " ~ T.stringof);
 	}
 
@@ -1323,7 +1362,7 @@ struct BsonSerializer {
 			import std.format;
 			m_dst.put(tp);
 			static struct Wrapper {
-				Appender!(ubyte[])* app;
+				AllocAppender!(ubyte[])* app;
 				void put(char ch) { (*app).put(ch); }
 				void put(in char[] str) { (*app).put(cast(ubyte[])str); }
 			}
@@ -1363,9 +1402,15 @@ struct BsonSerializer {
 		static if (is(T == Bson)) return m_inputData;
 		else static if (is(T == Json)) return m_inputData.toJson();
 		else static if (is(T == bool)) return m_inputData.get!bool();
+		else static if (is(T == uint)) return cast(T)m_inputData.get!int();
 		else static if (is(T : int)) return m_inputData.get!int().to!T;
 		else static if (is(T : long)) return cast(T)m_inputData.get!long();
 		else static if (is(T : double)) return cast(T)m_inputData.get!double();
+		else static if (is(T == SysTime)) {
+			// support legacy behavior to serialize as string
+			if (m_inputData.type == Bson.Type.string) return SysTime.fromISOExtString(m_inputData.get!string);
+			else return m_inputData.get!BsonDate().toSysTime();
+		}
 		else static if (isBsonSerializable!T) return T.fromBson(readValue!Bson);
 		else static if (isJsonSerializable!T) return T.fromJson(readValue!Bson.toJson());
 		else static if (is(T : const(ubyte)[])) {
@@ -1382,7 +1427,7 @@ struct BsonSerializer {
 		return false;
 	}
 
-	private static Bson.Type getBsonTypeID(T, bool accept_ao = false)(T value)
+	private static Bson.Type getBsonTypeID(T, bool accept_ao = false)(/*auto ref const*/ in T value)
 	{
 		Bson.Type tp;
 		static if (is(T == Bson)) tp = value.type;
@@ -1392,6 +1437,7 @@ struct BsonSerializer {
 		else static if (is(T == BsonBinData)) tp = Bson.Type.binData;
 		else static if (is(T == BsonObjectID)) tp = Bson.Type.objectID;
 		else static if (is(T == BsonDate)) tp = Bson.Type.date;
+		else static if (is(T == SysTime)) tp = Bson.Type.date;
 		else static if (is(T == BsonRegex)) tp = Bson.Type.regex;
 		else static if (is(T == BsonTimestamp)) tp = Bson.Type.timestamp;
 		else static if (is(T == bool)) tp = Bson.Type.bool_;
@@ -1499,7 +1545,7 @@ private string skipCString(ref bdata_t data)
 	return cast(string)ret;
 }
 
-private void putCString(R)(R dst, string str)
+private void putCString(R)(ref R dst, string str)
 {
 	dst.put(cast(bdata_t)str);
 	dst.put(cast(ubyte)0);
@@ -1510,9 +1556,12 @@ ubyte[] toBsonData(T)(T v)
 	/*static T tmp;
 	tmp = nativeToLittleEndian(v);
 	return cast(ubyte[])((&tmp)[0 .. 1]);*/
-	static ubyte[T.sizeof] ret;
-	ret = nativeToLittleEndian(v);
-	return ret;
+	if (__ctfe) return nativeToLittleEndian(v).dup;
+	else {
+		static ubyte[T.sizeof] ret;
+		ret = nativeToLittleEndian(v);
+		return ret;
+	}
 }
 
 T fromBsonData(T)(in ubyte[] v)
@@ -1525,12 +1574,12 @@ T fromBsonData(T)(in ubyte[] v)
 
 ubyte[] toBigEndianData(T)(T v)
 {
-	/*static T tmp;
-	tmp = nativeToBigEndian(v);
-	return cast(ubyte[])((&tmp)[0 .. 1]);*/
-	static ubyte[T.sizeof] ret;
-	ret = nativeToBigEndian(v);
-	return ret;
+	if (__ctfe) return nativeToBigEndian(v).dup;
+	else {
+		static ubyte[T.sizeof] ret;
+		ret = nativeToBigEndian(v);
+		return ret;
+	}
 }
 
 private string underscoreStrip(string field_name)

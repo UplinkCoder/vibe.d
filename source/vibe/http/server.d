@@ -91,7 +91,7 @@ void listenHTTP(HTTPServerSettings settings, HTTPServerRequestDelegate request_h
 	if (s_distHost.length && !settings.disableDistHost) {
 		listenHTTPDist(settings, request_handler, s_distHost, s_distPort);
 	} else {
-		listenHTTPPlain(settings, request_handler);
+		listenHTTPPlain(settings);
 	}
 }
 /// ditto
@@ -105,9 +105,6 @@ void listenHTTP(HTTPServerSettings settings, HTTPServerRequestHandler request_ha
 	listenHTTP(settings, &request_handler.handleRequest);
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use listenHTTP instead.") alias listenHttp = listenHTTP;
-
 
 /**
 	[private] Starts a HTTP server listening on the specified port.
@@ -115,16 +112,22 @@ deprecated("Please use listenHTTP instead.") alias listenHttp = listenHTTP;
 	This is the same as listenHTTP() except that it does not use a VibeDist host for
 	remote listening, even if specified on the command line.
 */
-private void listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequestDelegate request_handler)
+private void listenHTTPPlain(HTTPServerSettings settings)
 {
-	static void doListen(HTTPServerSettings settings, HTTPServerListener listener, string addr)
+	static bool doListen(HTTPServerSettings settings, HTTPServerListener listener, string addr)
 	{
 		try {
 			bool dist = (settings.options & HTTPServerOption.distribute) != 0;
 			listenTCP(settings.port, (TCPConnection conn){ handleHTTPConnection(conn, listener); }, addr, dist ? TCPListenOptions.distribute : TCPListenOptions.defaults);
 			logInfo("Listening for HTTP%s requests on %s:%s", settings.sslContext ? "S" : "", addr, settings.port);
-		} catch( Exception e ) logWarn("Failed to listen on %s:%s", addr, settings.port);
+			return true;
+		} catch( Exception e ) {
+			logWarn("Failed to listen on %s:%s", addr, settings.port);
+			return false;
+		}
 	}
+
+	bool any_succeeded = false;
 
 	// Check for every bind address/port, if a new listening socket needs to be created and
 	// check for conflicting servers
@@ -143,29 +146,22 @@ private void listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequestDeleg
 						"listening on "~addr~":"~to!string(settings.port)~".");*/
 				}
 				found_listener = true;
+				any_succeeded = true;
 				break;
 			}
 		}
 		if (!found_listener) {
 			auto listener = HTTPServerListener(addr, settings.port, settings.sslContext);
-			g_listeners ~= listener;
-			doListen(settings, listener, addr); // DMD BUG 2043
+			if (doListen(settings, listener, addr)) // DMD BUG 2043
+			{
+				any_succeeded = true;
+				g_listeners ~= listener;
+			}
 		}
 	}
-}
-/// ditto
-void listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequestFunction request_handler)
-{
-	listenHTTPPlain(settings, toDelegate(request_handler));
-}
-/// ditto
-void listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequestHandler request_handler)
-{
-	listenHTTPPlain(settings, &request_handler.handleRequest);
-}
 
-/// Deprecated compatibility alias
-deprecated("Please use listenHTTPPlain instead.") alias listenHttpPlain = listenHTTPPlain;
+	enforce(any_succeeded, "Failed to listen for incoming HTTP connections on any of the supplied interfaces.");
+}
 
 
 /**
@@ -175,28 +171,45 @@ deprecated("Please use listenHTTPPlain instead.") alias listenHttpPlain = listen
 {
 	import vibe.templ.diet;
 	return (HTTPServerRequest req, HTTPServerResponse res){
-		//res.render!(template_file, req);
-		//res.headers["Content-Type"] = "text/html; charset=UTF-8";
-		//parseDietFile!(template_file, req)(res.bodyWriter);
-		res.renderCompat!(template_file, HTTPServerRequest, "req")(req);
+		res.render!(template_file, req);
 	};
 }
 
 /**
 	Provides a HTTP request handler that responds with a static redirection to the specified URL.
+
+	Params:
+		url = The URL to redirect to
+		status = Redirection status to use (by default this is $(D HTTPStatus.found)
+
+	Returns:
+		Returns a $(D HTTPServerRequestDelegate) that performs the redirect
 */
-HTTPServerRequestDelegate staticRedirect(string url)
+HTTPServerRequestDelegate staticRedirect(string url, HTTPStatus status = HTTPStatus.found)
 {
 	return (HTTPServerRequest req, HTTPServerResponse res){
-		res.redirect(url);
+		res.redirect(url, status);
 	};
 }
 /// ditto
-HTTPServerRequestDelegate staticRedirect(URL url)
+HTTPServerRequestDelegate staticRedirect(URL url, HTTPStatus status = HTTPStatus.found)
 {
 	return (HTTPServerRequest req, HTTPServerResponse res){
-		res.redirect(url);
+		res.redirect(url, status);
 	};
+}
+
+///
+unittest {
+	import vibe.http.router;
+
+	void test()
+	{
+		auto router = new URLRouter;
+		router.get("/old_url", staticRedirect("http://example.org/new_url", HTTPStatus.movedPermanently));
+
+		listenHTTP(new HTTPServerSettings, router);
+	}
 }
 
 
@@ -208,8 +221,6 @@ void setVibeDistHost(string host, ushort port)
 	s_distHost = host;
 	s_distPort = port;
 }
-
-deprecated("This function does nothing, no need to call it anymore.") void startListening() {}
 
 
 /**
@@ -235,6 +246,50 @@ deprecated("This function does nothing, no need to call it anymore.") void start
 }
 
 
+/**
+	Creates a HTTPServerRequest suitable for writing unit tests.
+*/
+HTTPServerRequest createTestHTTPServerRequest(URL url, HTTPMethod method = HTTPMethod.GET, InputStream data = null)
+{
+	InetHeaderMap headers;
+	return createTestHTTPServerRequest(url, method, headers, data);
+}
+/// ditto
+HTTPServerRequest createTestHTTPServerRequest(URL url, HTTPMethod method, InetHeaderMap headers, InputStream data = null)
+{
+	auto ssl = url.schema == "https";
+	auto ret = new HTTPServerRequest(Clock.currTime(UTC()), url.port ? url.port : ssl ? 443 : 80);
+	ret.path = url.pathString;
+	ret.queryString = url.queryString;
+	ret.username = url.username;
+	ret.password = url.password;
+	ret.requestURL = url.localURI;
+	ret.method = method;
+	ret.ssl = ssl;
+	ret.headers = headers;
+	ret.bodyReader = data;
+	return ret;
+}
+
+/**
+	Creates a HTTPServerResponse suitable for writing unit tests.
+*/
+HTTPServerResponse createTestHTTPServerResponse(OutputStream data_sink = null, SessionStore session_store = null)
+{
+	import vibe.stream.wrapper;
+
+	HTTPServerSettings settings;
+	if (session_store) {
+		settings = new HTTPServerSettings;
+		settings.sessionStore = session_store;
+	}
+	if (!data_sink) data_sink = new NullOutputStream;
+	auto stream = new ProxyStream(null, data_sink);
+	auto ret = new HTTPServerResponse(stream, null, settings, defaultAllocator());
+	return ret;
+}
+
+
 /**************************************************************************************************/
 /* Public types                                                                                   */
 /**************************************************************************************************/
@@ -250,20 +305,8 @@ interface HTTPServerRequestHandler {
 }
 
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerRequestDelegate instead.") alias HttpServerRequestDelegate = HTTPServerRequestDelegate;
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerRequestFunction instead.") alias HttpServerRequestFunction = HTTPServerRequestFunction;
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerRequestHandler instead.") alias HttpServerRequestHandler = HTTPServerRequestHandler;
-
-/// Compatibility alias.
-deprecated("Please use HTTPServerRequestHandler instead.")
-alias IHttpServerRequestHandler = HTTPServerRequestHandler;
-
-
 /// Aggregates all information about an HTTP error status.
-class HTTPServerErrorInfo {
+final class HTTPServerErrorInfo {
 	/// The HTTP status code
 	int code;
 	/// The error message
@@ -274,15 +317,8 @@ class HTTPServerErrorInfo {
 	Throwable exception;
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerErrorInfo instead.") alias HttpServerErrorInfo = HTTPServerErrorInfo;
-
-
 /// Delegate type used for user defined error page generator callbacks.
 alias HTTPServerErrorPageHandler = void delegate(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInfo error);
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerErrorPageHandler instead.") alias HttpServerErrorPageHandler = HTTPServerErrorPageHandler;
 
 
 /**
@@ -310,6 +346,28 @@ enum HTTPServerOption {
 	parseCookies              = 1<<5,
 	/// Distributes request processing among worker threads
 	distribute                = 1<<6,
+	/** Enables stack traces (HTTPServerErrorInfo.debugMessage).
+
+		Note that generating the stack traces are generally a costly
+		operation that should usually be avoided in production
+		environments. It can also reveal internal information about
+		the application, such as function addresses, which can
+		help an attacker to abuse possible security holes.
+	*/
+	errorStackTraces          = 1<<7,
+
+	/** The default set of options.
+
+		Includes all options, except for distribute.
+	*/
+	defaults =
+		parseURL |
+		parseQueryString |
+		parseFormBody |
+		parseJsonBody |
+		parseMultiPartBody |
+		parseCookies |
+		errorStackTraces,
 
 	/// deprecated
 	None = none,
@@ -327,16 +385,13 @@ enum HTTPServerOption {
 	ParseCookies = parseCookies
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerOption instead.") alias HttpServerOption = HTTPServerOption;
-
 
 /**
 	Contains all settings for configuring a basic HTTP server.
 
 	The defaults are sufficient for most normal uses.
 */
-class HTTPServerSettings {
+final class HTTPServerSettings {
 	/** The port on which the HTTP server is listening.
 
 		The default value is 80. If you are running a SSL enabled server you may want to set this
@@ -360,15 +415,10 @@ class HTTPServerSettings {
 	/** Configures optional features of the HTTP server
 	
 		Disabling unneeded features can improve performance or reduce the server
-		load in case of invalid or unwanted requests (DoS).
+		load in case of invalid or unwanted requests (DoS). By default,
+		HTTPServerOption.defaults is used.
 	*/
-	HTTPServerOption options =
-		HTTPServerOption.parseURL |
-		HTTPServerOption.parseQueryString |
-		HTTPServerOption.parseFormBody |
-		HTTPServerOption.parseJsonBody |
-		HTTPServerOption.parseMultiPartBody |
-		HTTPServerOption.parseCookies;
+	HTTPServerOption options = HTTPServerOption.defaults;
 	
 	/** Time of a request after which the connection is closed with an error; not supported yet
 
@@ -453,9 +503,6 @@ class HTTPServerSettings {
 		keepAliveTimeout = 10.seconds;
 	}
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerSettings instead.") alias HttpServerSettings = HTTPServerSettings;
 
 
 /**
@@ -601,7 +648,7 @@ final class HTTPServerRequest : HTTPRequest {
 				This field is only set if HTTPServerOption.parseFormBody is set
 				and if the Content-Type is "multipart/form-data".
 		*/
-		FilePart[string] files;
+		FilePartFormFields files;
 
 		/** The current Session object.
 
@@ -661,9 +708,6 @@ final class HTTPServerRequest : HTTPRequest {
 		return url;
 	}
 
-	/// Deprecated compatibility alias
-	deprecated("Please use fullURL instead.") alias fullUrl = fullURL;
-
 	/** The relative path the the root folder.
 
 		Using this function instead of absolute URLs for embedded links can be
@@ -679,9 +723,6 @@ final class HTTPServerRequest : HTTPRequest {
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerRequest instead.") alias HttpServerRequest = HTTPServerRequest;
-
 
 /**
 	Represents a HTTP response as sent from the server side.
@@ -691,7 +732,7 @@ final class HTTPServerResponse : HTTPResponse {
 		Stream m_conn;
 		ConnectionStream m_rawConnection;
 		OutputStream m_bodyWriter;
-		shared(Allocator) m_requestAlloc;
+		Allocator m_requestAlloc;
 		FreeListRef!ChunkedOutputStream m_chunkedBodyWriter;
 		FreeListRef!CountingOutputStream m_countingWriter;
 		FreeListRef!GzipOutputStream m_gzipOutputStream;
@@ -704,7 +745,7 @@ final class HTTPServerResponse : HTTPResponse {
 		SysTime m_timeFinalized;
 	}
 
-	this(Stream conn, ConnectionStream raw_connection, HTTPServerSettings settings, shared(Allocator) req_alloc)
+	this(Stream conn, ConnectionStream raw_connection, HTTPServerSettings settings, Allocator req_alloc)
 	{
 		m_conn = conn;
 		m_rawConnection = raw_connection;
@@ -857,7 +898,12 @@ final class HTTPServerResponse : HTTPResponse {
 		return m_bodyWriter;
 	}	
 
-	/// Sends a redirect request to the client.
+	/** Sends a redirect request to the client.
+
+		Params:
+			url = The URL to redirect to
+			status = The HTTP redirect status (3xx) to send - by default this is a 302 "found"
+	*/
 	void redirect(string url, int status = HTTPStatus.Found)
 	{
 		statusCode = status;
@@ -870,6 +916,25 @@ final class HTTPServerResponse : HTTPResponse {
 	{
 		redirect(url.toString(), status);
 	}
+
+	///
+	unittest {
+		import vibe.http.router;
+
+		void request_handler(HTTPServerRequest req, HTTPServerResponse res)
+		{
+			res.redirect("http://example.org/some_other_url");
+		}
+
+		void test()
+		{
+			auto router = new URLRouter;
+			router.get("/old_url", &request_handler);
+
+			listenHTTP(new HTTPServerSettings, router);
+		}
+	}
+
 
 	/** Special method sending a SWITCHING_PROTOCOLS response to the client.
 	*/
@@ -929,11 +994,12 @@ final class HTTPServerResponse : HTTPResponse {
 	}
 
 	/**
-		Compatibility overload - will be deprecated soon.
+		Deprecated compatibility overload.
 
 		Uses boolean parameters instead of SessionOption to specify the
 		session options SessionOption.secure and SessionOption.httpOnly.
 	*/
+	deprecated("Use startSession() with a SessionOption parameter instead.")
 	Session startSession(string path, bool secure, bool httpOnly = true)
 	{
 		return startSession(path, (secure ? SessionOption.secure : SessionOption.none) | (httpOnly ? SessionOption.httpOnly : SessionOption.none));
@@ -1004,15 +1070,16 @@ final class HTTPServerResponse : HTTPResponse {
 
 	private void writeHeader()
 	{
+		import vibe.stream.wrapper;
+
 		assert(!m_bodyWriter && !m_headerWritten, "Try to write header after body has already begun.");
 		m_headerWritten = true;
-		auto app = AllocAppender!string(m_requestAlloc);
-		app.reserve(256);
+		auto dst = StreamOutputRange(m_conn);
 
 		void writeLine(T...)(string fmt, T args)
 		{
-			formattedWrite(&app, fmt, args);
-			app.put("\r\n");
+			formattedWrite(&dst, fmt, args);
+			dst.put("\r\n");
 			logTrace(fmt, args);
 		}
 
@@ -1042,46 +1109,39 @@ final class HTTPServerResponse : HTTPResponse {
 		// write cookies
 		if (!empty(cookies)) {
 			foreach (n, cookie; this.cookies) {
-				app.put("Set-Cookie: ");
-				app.put(n);
-				app.put('=');
-				auto appref = &app;
+				dst.put("Set-Cookie: ");
+				dst.put(n);
+				dst.put('=');
+				auto appref = &dst;
 				filterURLEncode(appref, cookie.value);
 				if (cookie.domain) {
-					app.put("; Domain=");
-					app.put(cookie.domain);
+					dst.put("; Domain=");
+					dst.put(cookie.domain);
 				}
 				if (cookie.path) {
-					app.put("; Path=");
-					app.put(cookie.path);
+					dst.put("; Path=");
+					dst.put(cookie.path);
 				}
 				if (cookie.expires) {
-					app.put("; Expires=");
-					app.put(cookie.expires);
+					dst.put("; Expires=");
+					dst.put(cookie.expires);
 				}
 				if (cookie.maxAge) {
-					app.put("; Max-Age=");
-					formattedWrite(&app, "%s", cookie.maxAge);
+					dst.put("; Max-Age=");
+					formattedWrite(&dst, "%s", cookie.maxAge);
 				}
-				if (cookie.secure) {
-					app.put("; Secure");
-				}
-				if (cookie.httpOnly) {
-					app.put("; HttpOnly");
-				}
-				app.put("\r\n");
+				if (cookie.secure) dst.put("; Secure");
+				if (cookie.httpOnly) dst.put("; HttpOnly");
+				dst.put("\r\n");
 			}
 		}
 
 		// finalize reposonse header
-		app.put("\r\n");
-		m_conn.write(app.data);
+		dst.put("\r\n");
+		dst.flush();
 		m_conn.flush();
 	}
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPServerResponse instead.") alias HttpServerResponse = HTTPServerResponse;
 
 
 /**************************************************************************************************/
@@ -1102,7 +1162,7 @@ private struct HTTPServerListener {
 
 private enum MaxHTTPHeaderLineLength = 4096;
 
-private class LimitedHTTPInputStream : LimitedInputStream {
+private final class LimitedHTTPInputStream : LimitedInputStream {
 	this(InputStream stream, ulong byte_limit, bool silent_limit = false) {
 		super(stream, byte_limit, silent_limit);
 	}
@@ -1111,7 +1171,7 @@ private class LimitedHTTPInputStream : LimitedInputStream {
 	}
 }
 
-private class TimeoutHTTPInputStream : InputStream {
+private final class TimeoutHTTPInputStream : InputStream {
 	private {
 		long m_timeref;
 		long m_timeleft;
@@ -1172,7 +1232,7 @@ private void handleHTTPConnection(TCPConnection connection, HTTPServerListener l
 	// If this is a HTTPS server, initiate SSL
 	if (listen_info.sslContext) {
 		logTrace("accept ssl");
-		ssl_stream = FreeListRef!SSLStream(http_stream, listen_info.sslContext, SSLStreamState.accepting);
+		ssl_stream = createSSLStreamFL(http_stream, listen_info.sslContext, SSLStreamState.accepting);
 		http_stream = ssl_stream;
 	}
 
@@ -1180,13 +1240,13 @@ private void handleHTTPConnection(TCPConnection connection, HTTPServerListener l
 		HTTPServerSettings settings;
 		bool keep_alive;
 		handleRequest(http_stream, connection, listen_info, settings, keep_alive);
-		if (!keep_alive) { logTrace("No keep-alive"); break; }
-		if (connection.empty) { logTrace("Client disconnected."); break; }
+		if (!keep_alive) { logTrace("No keep-alive - disconnecting client."); break; }
 
 		logTrace("Waiting for next request...");
 		// wait for another possible request on a keep-alive connection
 		if (!connection.waitForData(settings.keepAliveTimeout)) {
-			logDebug("persistent connection timeout!");
+			if (!connection.connected) logTrace("Client disconnected.");
+			else logDebug("Keep-alive connection timed out!");
 			break;
 		}
 	} while(!connection.empty);
@@ -1200,8 +1260,8 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 	auto peer_address = tcp_connection.remoteAddress;
 	SysTime reqtime = Clock.currTime(UTC());
 
-	//auto request_allocator = scoped!(shared(PoolAllocator))(1024, defaultAllocator());
-	scope request_allocator = new shared PoolAllocator(1024, defaultAllocator());
+	//auto request_allocator = scoped!(PoolAllocator)(1024, defaultAllocator());
+	scope request_allocator = new PoolAllocator(1024, defaultAllocator());
 	scope(exit) request_allocator.reset();
 
 	// some instances that live only while the request is running
@@ -1393,17 +1453,23 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 		request_task(req, res);
 
 		// if no one has written anything, return 404
-		enforceHTTP(res.headerWritten, HTTPStatus.notFound);
+		if (!res.headerWritten) {
+			logDiagnostic("No response written for %s", req.requestURL);
+			errorOut(HTTPStatus.notFound, httpStatusText(HTTPStatus.notFound), null, null);
+		}
 	} catch (HTTPStatusException err) {
-		logDebug("http error thrown: %s", err.toString().sanitize);
-		if (!res.headerWritten) errorOut(err.status, err.msg, err.toString(), err);
+		string dbg_msg;
+		if (settings.options & HTTPServerOption.errorStackTraces) dbg_msg = err.toString().sanitize;
+		if (!res.headerWritten) errorOut(err.status, err.msg, dbg_msg, err);
 		else logDiagnostic("HTTPStatusException while writing the response: %s", err.msg);
-		logDebug("Exception while handling request %s %s: %s", req.method, req.requestURL, err.toString());
+		logDebug("Exception while handling request %s %s: %s", req.method, req.requestURL, err.toString().sanitize);
 		if (!parsed || res.headerWritten || justifiesConnectionClose(err.status))
 			keep_alive = false;
-	} catch (Throwable e) {
+	} catch (UncaughtException e) {
 		auto status = parsed ? HTTPStatus.internalServerError : HTTPStatus.badRequest;
-		if (!res.headerWritten && tcp_connection.connected) errorOut(status, httpStatusText(status), e.toString(), e);
+		string dbg_msg;
+		if (settings.options & HTTPServerOption.errorStackTraces) dbg_msg = e.toString().sanitize;
+		if (!res.headerWritten && tcp_connection.connected) errorOut(status, httpStatusText(status), dbg_msg, e);
 		else logDiagnostic("Error while writing the response: %s", e.msg);
 		logDebug("Exception while handling request %s %s: %s", req.method, req.requestURL, e.toString().sanitize());
 		if (!parsed || res.headerWritten || !cast(Exception)e) keep_alive = false;
@@ -1436,7 +1502,7 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 }
 
 
-private void parseRequestHeader(HTTPServerRequest req, InputStream http_stream, shared(Allocator) alloc, ulong max_header_size)
+private void parseRequestHeader(HTTPServerRequest req, InputStream http_stream, Allocator alloc, ulong max_header_size)
 {
 	auto stream = FreeListRef!LimitedHTTPInputStream(http_stream, max_header_size);
 
@@ -1495,9 +1561,12 @@ shared static this()
 	setVibeDistHost(disthost, distport);
 }
 
-private string formatRFC822DateAlloc(shared(Allocator) alloc, SysTime time)
+private string formatRFC822DateAlloc(Allocator alloc, SysTime time)
 {
 	auto app = AllocAppender!string(alloc);
 	writeRFC822DateTimeString(app, time);
 	return app.data;
 }
+
+version (VibeDebugCatchAll) private alias UncaughtException = Throwable;
+else private alias UncaughtException = Exception;

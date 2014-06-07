@@ -13,6 +13,7 @@ import core.sync.mutex;
 import core.time;
 import std.algorithm : min;
 import std.exception;
+import vibe.core.core;
 import vibe.core.sync;
 import vibe.utils.array;
 
@@ -20,7 +21,7 @@ import vibe.utils.array;
 /**
 	Implements a unidirectional data pipe between two tasks.
 */
-class TaskPipe : ConnectionStream {
+final class TaskPipe : ConnectionStream {
 	private {
 		TaskPipeImpl m_pipe;
 	}
@@ -32,10 +33,12 @@ class TaskPipe : ConnectionStream {
 		m_pipe = new TaskPipeImpl(grow_when_full);
 	}
 
-	/// Read end of the pipe (scheduled for deprecation)
+	/// Deprecated. Read end of the pipe.
+	deprecated("Use TaskPipe directly as an input stream instead.")
 	@property InputStream reader() { return this; }
 
-	/// Write end of the pipe (scheduled for deprecation)
+	/// Deprecated. Write end of the pipe.
+	deprecated("Use TaskPipe directly as an output stream instead.")
 	@property OutputStream writer() { return this; }
 
 	/// Size of the (fixed) FIFO buffer used to transfer data between tasks
@@ -67,7 +70,7 @@ class TaskPipe : ConnectionStream {
 /**
 	Underyling pipe implementation for TaskPipe with no Stream interface.
 */
-private class TaskPipeImpl {
+private final class TaskPipeImpl {
 	private {
 		Mutex m_mutex;
 		TaskCondition m_condition;

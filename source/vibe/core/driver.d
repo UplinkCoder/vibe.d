@@ -18,18 +18,32 @@ import vibe.inet.url;
 import core.time;
 import std.exception;
 
+version (VibeLibevDriver) {
+	import vibe.core.drivers.libev;
+	alias NativeEventDriver = Win32EventDriver;
+} else version (VibeLibeventDriver) {
+	import vibe.core.drivers.libevent2;
+	alias NativeEventDriver = Libevent2Driver;
+} else version (VibeWin32Driver) {
+	import vibe.core.drivers.win32;
+	alias NativeEventDriver = Win32EventDriver;
+} else version (VibeWinrtDriver) {
+	import vibe.core.drivers.winrt;
+	alias NativeEventDriver = WinRTEventDriver;
+} else static assert(false, "No event driver has been selected. Please specify a -version=Vibe*Driver for the desired driver.");
+
 
 /**
 	Returns the active event driver
 */
-EventDriver getEventDriver(bool ignore_unloaded = false)
+NativeEventDriver getEventDriver(bool ignore_unloaded = false)
 {
 	assert(ignore_unloaded || s_driver !is null, "No event driver loaded. Did the vibe.core.core module constructor run?");
 	return s_driver;
 }
 
 /// private
-package void setEventDriver(EventDriver driver)
+package void setEventDriver(NativeEventDriver driver)
 {
 	s_driver = driver;
 }
@@ -38,11 +52,12 @@ package void deleteEventDriver()
 {
 	// TODO: use destroy() instead
 	delete s_driver;
+	s_driver = null;
 }
 
 
 private {
-	EventDriver s_driver;
+	NativeEventDriver s_driver;
 }
 
 
@@ -91,9 +106,6 @@ interface EventDriver {
 	*/
 	TCPConnection connectTCP(NetworkAddress address);
 
-	/// Deprecated compatibility alias
-	deprecated("Please use connectTCP instead.") alias connectTcp = connectTCP;
-
 	/** Listens on the specified port and interface for TCP connections.
 
 		'bind_address' must be an IPv4 or IPv6 address string corresponding to a local network
@@ -102,18 +114,12 @@ interface EventDriver {
 	*/
 	TCPListener listenTCP(ushort port, void delegate(TCPConnection conn) conn_callback, string bind_address, TCPListenOptions options);
 
-	/// Deprecated compatibility alias
-	deprecated("Please use listenTCP instead.") alias listenTcp = listenTCP;
-
 	/** Creates a new UDP socket and sets the specified address/port as the destination for packets.
 
 		If a bind port is specified, the socket will be able to receive UDP packets on that port.
 		Otherwise, a random bind port is chosen.
 	*/
 	UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0");
-
-	/// Deprecated compatibility alias
-	deprecated("Please use listenUDP instead.") alias listenUdp = listenUDP;
 
 	/** Creates a new manually triggered event.
 	*/
@@ -122,9 +128,6 @@ interface EventDriver {
 	/** Creates an event for waiting on a non-bocking file handle.
 	*/
 	FileDescriptorEvent createFileDescriptorEvent(int file_descriptor, FileDescriptorEvent.Trigger triggers);
-
-	/// Deprecated compatibility alias
-	deprecated("Please use createNanualEvent instead.") alias createSignal = createManualEvent;
 
 	/** Creates a new timer.
 

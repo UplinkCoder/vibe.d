@@ -1,7 +1,7 @@
 /**
 	libevent based driver
 
-	Copyright: © 2012-2013 RejectedSoftware e.K.
+	Copyright: © 2012-2014 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
@@ -13,6 +13,7 @@ version(VibeLibeventDriver)
 import vibe.core.driver;
 import vibe.core.drivers.libevent2_tcp;
 import vibe.core.drivers.threadedfile;
+import vibe.core.drivers.timerqueue;
 import vibe.core.drivers.utils;
 import vibe.core.log;
 import vibe.utils.array : ArraySet;
@@ -36,8 +37,10 @@ import deimos.event2.event;
 import deimos.event2.thread;
 import deimos.event2.util;
 import std.conv;
+import std.datetime;
 import std.encoding : sanitize;
 import std.exception;
+import std.range : assumeSorted;
 import std.string;
 
 
@@ -57,8 +60,8 @@ version(Windows)
 }
 
 
-class Libevent2Driver : EventDriver {
-	import std.container : Array, BinaryHeap, heapify;
+final class Libevent2Driver : EventDriver {
+	import std.container : DList;
 	import std.datetime : Clock;
 
 	private {
@@ -70,9 +73,9 @@ class Libevent2Driver : EventDriver {
 		debug Thread m_ownerThread;
 
 		event* m_timerEvent;
-		int m_timerIDCounter = 1;
-		HashMap!(size_t, TimerInfo) m_timers;
-		BinaryHeap!(Array!TimeoutEntry, "a.timeout > b.timeout") m_timeoutHeap;
+		TimerQueue!TimerInfo m_timers;
+		DList!AddressInfo m_addressInfoCache;
+		size_t m_addressInfoCacheLength = 0;
 	}
 
 	this(DriverCore core)
@@ -200,7 +203,7 @@ class Libevent2Driver : EventDriver {
 		enforce(event_base_loopbreak(m_eventLoop) == 0, "Failed to exit libevent event loop.");
 	}
 
-	FileStream openFile(Path path, FileMode mode)
+	ThreadedFileStream openFile(Path path, FileMode mode)
 	{
 		return new ThreadedFileStream(path, mode);
 	}
@@ -213,6 +216,10 @@ class Libevent2Driver : EventDriver {
 	NetworkAddress resolveHost(string host, ushort family = AF_UNSPEC, bool use_dns = true)
 	{
 		assert(m_dnsBase);
+
+		foreach (ai; m_addressInfoCache)
+			if (ai.host == host && ai.family == family && ai.useDNS == use_dns)
+				return ai.address;
 
 		evutil_addrinfo hints;
 		hints.ai_family = family;
@@ -231,18 +238,22 @@ class Libevent2Driver : EventDriver {
 
 		// wait if the request couldn't be fulfilled instantly
 		if (!msg.done) {
+			assert(dnsReq !is null);
 			msg.task = Task.getThis();
 			logDebug("dnsresolve yield");
 			while (!msg.done) m_core.yieldForEvent();
 		}
 
 		logDebug("dnsresolve ret");
-		enforce(msg.err == DNS_ERR_NONE, format("Failed to lookup host '%s': %s", host, evutil_gai_strerror(msg.err)));
+		enforce(msg.err == DNS_ERR_NONE, format("Failed to lookup host '%s': %s", host, to!string(evutil_gai_strerror(msg.err))));
 
+		if (m_addressInfoCacheLength >= 10) m_addressInfoCache.removeFront();
+		else m_addressInfoCacheLength++;
+		m_addressInfoCache.insertBack(AddressInfo(msg.addr, host, family, use_dns));
 		return msg.addr;
 	}
 
-	TCPConnection connectTCP(NetworkAddress addr)
+	Libevent2TCPConnection connectTCP(NetworkAddress addr)
 	{
 		
 		auto sockfd_raw = socket(addr.family, SOCK_STREAM, 0);
@@ -273,12 +284,15 @@ class Libevent2Driver : EventDriver {
 		cctx.readOwner = Task.getThis();
 		scope(exit) cctx.readOwner = Task();
 
+		assert(cctx.exception is null);
 		socketEnforce(bufferevent_socket_connect(buf_event, addr.sockAddr, addr.sockAddrLen) == 0,
 			"Failed to connect to " ~ addr.toString());
-
-	// TODO: cctx.remove_addr6 = ...;
 		
 		try {
+			cctx.checkForException();
+
+			// TODO: cctx.remote_addr6 = ...;
+
 			while (cctx.status == 0)
 				m_core.yieldForEvent();
 		} catch (Exception e) {
@@ -291,7 +305,7 @@ class Libevent2Driver : EventDriver {
 		return new Libevent2TCPConnection(cctx);
 	}
 
-	TCPListener listenTCP(ushort port, void delegate(TCPConnection conn) connection_callback, string address, TCPListenOptions options)
+	Libevent2TCPListener listenTCP(ushort port, void delegate(TCPConnection conn) connection_callback, string address, TCPListenOptions options)
 	{
 		auto bind_addr = resolveHost(address, AF_UNSPEC, false);
 		bind_addr.port = port;
@@ -313,9 +327,9 @@ class Libevent2Driver : EventDriver {
 		enforce(evutil_make_socket_nonblocking(listenfd) == 0,
 			"Error setting listening socket to non-blocking I/O.");
 
-		auto ret = new LibeventTCPListener;
+		auto ret = new Libevent2TCPListener;
 
-		static void setupConnectionHandler(shared(LibeventTCPListener) listener, typeof(listenfd) listenfd, NetworkAddress bind_addr, shared(void delegate(TCPConnection conn)) connection_callback)
+		static void setupConnectionHandler(shared(Libevent2TCPListener) listener, typeof(listenfd) listenfd, NetworkAddress bind_addr, shared(void delegate(TCPConnection conn)) connection_callback, TCPListenOptions options)
 		{
 			auto evloop = getThreadLibeventEventLoop();
 			auto core = getThreadLibeventDriverCore();
@@ -323,19 +337,20 @@ class Libevent2Driver : EventDriver {
 			auto ctx = TCPContextAlloc.alloc(core, evloop, listenfd, null, bind_addr, NetworkAddress());
 			ctx.connectionCallback = cast()connection_callback;
 			ctx.listenEvent = event_new(evloop, listenfd, EV_READ | EV_PERSIST, &onConnect, ctx);
+			ctx.listenOptions = options;
 			enforce(event_add(ctx.listenEvent, null) == 0,
 				"Error scheduling connection event on the event loop.");
 			(cast()listener).addContext(ctx);
 		}
 
 		// FIXME: the API needs improvement with proper shared annotations, so the the following casts are not necessary
-		if (options & TCPListenOptions.distribute) runWorkerTaskDist(&setupConnectionHandler, cast(shared)ret, listenfd, bind_addr, cast(shared)connection_callback);
-		else setupConnectionHandler(cast(shared)ret, listenfd, bind_addr, cast(shared)connection_callback);
+		if (options & TCPListenOptions.distribute) runWorkerTaskDist(&setupConnectionHandler, cast(shared)ret, listenfd, bind_addr, cast(shared)connection_callback, options);
+		else setupConnectionHandler(cast(shared)ret, listenfd, bind_addr, cast(shared)connection_callback, options);
 
 		return ret;
 	}
 
-	UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
+	Libevent2UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
 	{
 		NetworkAddress bindaddr = resolveHost(bind_address, AF_UNSPEC, false);
 		bindaddr.port = port;
@@ -353,46 +368,31 @@ class Libevent2Driver : EventDriver {
 		return new Libevent2FileDescriptorEvent(this, fd, events);
 	}
 
-	size_t createTimer(void delegate() callback)
-	{
-		debug assert(m_ownerThread is Thread.getThis());
-		auto id = m_timerIDCounter++;
-		if (!id) id = m_timerIDCounter++;
-		m_timers[id] = TimerInfo(callback);
-		return id;
-	}
+	size_t createTimer(void delegate() callback) { return m_timers.create(TimerInfo(callback)); }
 
-	void acquireTimer(size_t timer_id) { m_timers[timer_id].refCount++; }
+	void acquireTimer(size_t timer_id) { m_timers.getUserData(timer_id).refCount++; }
 	void releaseTimer(size_t timer_id)
 	{
-		if (!--m_timers[timer_id].refCount)
-			m_timers.remove(timer_id);
+		debug assert(m_ownerThread is Thread.getThis());
+		if (!--m_timers.getUserData(timer_id).refCount)
+			m_timers.destroy(timer_id);
 	}
 
-	bool isTimerPending(size_t timer_id) { return m_timers[timer_id].pending; }
+	bool isTimerPending(size_t timer_id) { return m_timers.isPending(timer_id); }
 
 	void rearmTimer(size_t timer_id, Duration dur, bool periodic)
 	{
 		debug assert(m_ownerThread is Thread.getThis());
-		auto timeout = Clock.currStdTime() + dur.total!"hnsecs";
-		auto pt = timer_id in m_timers;
-		assert(pt !is null, "Accessing non-existent timer ID.");
-		pt.timeout = timeout;
-		pt.repeatDuration = periodic ? dur.total!"hnsecs" : 0;
-		if (!pt.pending) {
-			pt.pending = true;
-			acquireTimer(timer_id);
-		}
-		logDebugV("rearming timer %s in %s s", timer_id, dur.total!"usecs" * 1e-6);
-		scheduleTimer(timeout, timer_id);
+		if (!isTimerPending(timer_id)) acquireTimer(timer_id);
+		m_timers.schedule(timer_id, dur, periodic);
+		rescheduleTimerEvent(Clock.currTime(UTC()));
 	}
 
 	void stopTimer(size_t timer_id)
 	{
 		logTrace("Stopping timer %s", timer_id);
-		auto pt = timer_id in m_timers;
-		if (pt.pending) {
-			pt.pending = false;
+		if (m_timers.isPending(timer_id)) {
+			m_timers.unschedule(timer_id);
 			releaseTimer(timer_id);
 		}
 	}
@@ -401,17 +401,12 @@ class Libevent2Driver : EventDriver {
 	{
 		debug assert(m_ownerThread is Thread.getThis());
 		while (true) {
-			{
-				auto pt = timer_id in m_timers;
-				if (!pt || !pt.pending) return;
-				assert(pt.repeatDuration == 0, "Cannot wait for a periodic timer.");
-				assert(pt.owner == Task.init, "Waiting for the same timer from multiple tasks is not supported.");
-				pt.owner = Task.getThis();
-			}
-			scope (exit) {
-				auto pt = timer_id in m_timers;
-				if (pt) pt.owner = Task.init;
-			}
+			assert(!m_timers.isPeriodic(timer_id), "Cannot wait for a periodic timer.");
+			if (!m_timers.isPending(timer_id)) return;
+			auto data = &m_timers.getUserData(timer_id);
+			assert(data.owner == Task.init, "Waiting for the same timer from multiple tasks is not supported.");
+			data.owner = Task.getThis();
+			scope (exit) m_timers.getUserData(timer_id).owner = Task.init;
 			m_core.yieldForEvent();
 		}
 	}
@@ -419,54 +414,32 @@ class Libevent2Driver : EventDriver {
 	private void processTimers()
 	{
 		logTrace("Processing due timers");
-
 		// process all timers that have expired up to now
-		auto now = Clock.currStdTime();
-		if (m_timeoutHeap.empty) logTrace("no timers scheduled");
-		else logTrace("first timeout: %s", (m_timeoutHeap.front.timeout - now) * 1e-7);
-		while (!m_timeoutHeap.empty && (m_timeoutHeap.front.timeout - now) / 10_000 <= 0) {
-			auto tm = m_timeoutHeap.front.id;
-			m_timeoutHeap.removeFront();
+		auto now = Clock.currTime(UTC());
+		m_timers.consumeTimeouts(now, (timer, periodic, ref data) {
+			Task owner = data.owner;
+			auto callback = data.callback;
 
-			auto pt = tm in m_timers;
-			if (!pt || !pt.pending) continue;
-	
-			Task owner = pt.owner;
-			auto callback = pt.callback;
+			logTrace("Timer %s fired (%s/%s)", timer, owner != Task.init, callback !is null);
 
-			if (pt.repeatDuration > 0) {
-				pt.timeout += pt.repeatDuration;
-				scheduleTimer(pt.timeout, tm);
-			} else {
-				pt.pending = false;
-				releaseTimer(tm);
-			}
-
-			logTrace("Timer %s fired (%s/%s)", tm, owner != Task.init, callback !is null);
+			if (!periodic) releaseTimer(timer);
 
 			if (owner && owner.running) m_core.resumeTask(owner);
 			if (callback) runTask(callback);
-		}
+		});
 
-		if (!m_timeoutHeap.empty) rescheduleTimerEvent((m_timeoutHeap.front.timeout - now).hnsecs);
+		rescheduleTimerEvent(now);
 	}
 
-	private void scheduleTimer(long timeout, size_t id)
+	private void rescheduleTimerEvent(SysTime now)
 	{
-		logTrace("Schedule timer %s", id);
-		auto now = Clock.currStdTime();
-		if (m_timeoutHeap.empty || timeout < m_timeoutHeap.front.timeout) {
-			rescheduleTimerEvent((timeout - now).hnsecs);
-		}
-		m_timeoutHeap.insert(TimeoutEntry(timeout, id));
-		logDebugV("first timer %s in %s s", id, (timeout - now) * 1e-7);
-	}
+		auto next = m_timers.getFirstTimeout();
+		if (next == SysTime.max) return;
 
-	private void rescheduleTimerEvent(Duration dur)
-	{
+		auto dur = next - now;
 		event_del(m_timerEvent);
 		assert(dur.total!"seconds"() <= int.max);
-		dur += 9.hnsecs(); // round up to the next usec to avoid premature timer eventss
+		dur += 9.hnsecs(); // round up to the next usec to avoid premature timer events
 		timeval tvdur;
 		tvdur.tv_sec = cast(int)dur.total!"seconds"();
 		tvdur.tv_usec = dur.fracSec().usecs();
@@ -542,20 +515,20 @@ class Libevent2Driver : EventDriver {
 }
 
 private struct TimerInfo {
-	long timeout;
-	long repeatDuration;
 	size_t refCount = 1;
 	void delegate() callback;
 	Task owner;
-	bool pending;
 
 	this(void delegate() callback) { this.callback = callback; }
 }
 
-private struct TimeoutEntry {
-	long timeout;
-	size_t id;
+struct AddressInfo {
+	NetworkAddress address;
+	string host;
+	ushort family;
+	bool useDNS;
 }
+
 
 private struct GetAddrInfoMsg {
 	NetworkAddress addr;
@@ -595,7 +568,7 @@ struct ThreadSlot {
 /// private
 alias ThreadSlotMap = HashMap!(Thread, ThreadSlot);
 
-class Libevent2ManualEvent : Libevent2Object, ManualEvent {
+final class Libevent2ManualEvent : Libevent2Object, ManualEvent {
 	private {
 		shared(int) m_emitCount = 0;
 		core.sync.mutex.Mutex m_mutex;
@@ -649,7 +622,7 @@ class Libevent2ManualEvent : Libevent2Object, ManualEvent {
 		scope(exit) release();
 		auto tm = m_driver.createTimer(null);
 		scope (exit) m_driver.releaseTimer(tm);
-		m_driver.m_timers[tm].owner = Task.getThis();
+		m_driver.m_timers.getUserData(tm).owner = Task.getThis();
 		m_driver.rearmTimer(tm, timeout, false);
 
 		auto ec = this.emitCount;
@@ -737,7 +710,7 @@ class Libevent2ManualEvent : Libevent2Object, ManualEvent {
 }
 
 
-class Libevent2FileDescriptorEvent : Libevent2Object, FileDescriptorEvent {
+final class Libevent2FileDescriptorEvent : Libevent2Object, FileDescriptorEvent {
 	private {
 		int m_fd;
 		deimos.event2.event.event* m_event;
@@ -786,7 +759,7 @@ class Libevent2FileDescriptorEvent : Libevent2Object, FileDescriptorEvent {
 
 		auto tm = m_driver.createTimer(null);
 		scope (exit) m_driver.releaseTimer(tm);
-		m_driver.m_timers[tm].owner = Task.getThis();
+		m_driver.m_timers.getUserData(tm).owner = Task.getThis();
 		m_driver.rearmTimer(tm, timeout, false);
 
 		while ((m_activeEvents & which) == Trigger.none) {
@@ -817,7 +790,7 @@ class Libevent2FileDescriptorEvent : Libevent2Object, FileDescriptorEvent {
 }
 
 
-class Libevent2UDPConnection : UDPConnection {
+final class Libevent2UDPConnection : UDPConnection {
 	private {
 		Libevent2Driver m_driver;
 		TCPContext* m_ctx;
@@ -922,10 +895,27 @@ class Libevent2UDPConnection : UDPConnection {
 
 	ubyte[] recv(ubyte[] buf = null, NetworkAddress* peer_address = null)
 	{
+		return recv(Duration.max, buf, peer_address);
+	}
+
+	ubyte[] recv(Duration timeout, ubyte[] buf = null, NetworkAddress* peer_address = null)
+	{
+		size_t tm = size_t.max;
+		if (timeout >= 0.seconds && timeout != Duration.max) {
+			tm = m_driver.createTimer(null);
+			m_driver.rearmTimer(tm, timeout, false);
+			m_driver.acquireTimer(tm);
+		}
+
 		acquire();
-		scope (exit) release();
+
+		scope (exit) {
+			release();
+			if (tm != size_t.max) m_driver.releaseTimer(tm);
+		}
 
 		if (buf.length == 0) buf.length = 65507;
+
 		NetworkAddress from;
 		from.family = m_ctx.local_addr.family;
 		assert(buf.length <= int.max);
@@ -941,6 +931,9 @@ class Libevent2UDPConnection : UDPConnection {
 				if (err != EWOULDBLOCK) {
 					logDebugV("UDP recv err: %s", err);
 					throw new Exception("Error receiving UDP packet.");
+				}
+				if (timeout != Duration.max) {
+					enforce(timeout > 0.seconds && m_driver.isTimerPending(tm), "UDP receive timeout.");
 				}
 			}
 			m_ctx.core.yieldForEvent();
@@ -1008,13 +1001,16 @@ alias FreeListObjectAlloc!(Condition, false) ConditionAlloc;
 
 private nothrow extern(C)
 {
+	version (VibeDebugCatchAll) alias UncaughtException = Throwable;
+	else alias UncaughtException = Exception;
+
 	void* lev_alloc(size_t size)
 	{
 		try {
 			auto mem = manualAllocator().alloc(size+size_t.sizeof);
 			*cast(size_t*)mem.ptr = size;
 			return mem.ptr + size_t.sizeof;
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_alloc: %s", th.msg);
 			return null;
 		}
@@ -1028,7 +1024,7 @@ private nothrow extern(C)
 			auto newmem = manualAllocator().realloc(oldmem, newsize+size_t.sizeof);
 			*cast(size_t*)newmem.ptr = newsize;
 			return newmem.ptr + size_t.sizeof;
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_realloc: %s", th.msg);
 			return null;
 		}
@@ -1039,8 +1035,9 @@ private nothrow extern(C)
 			auto size = *cast(size_t*)(p-size_t.sizeof);
 			auto mem = (p-size_t.sizeof)[0 .. size+size_t.sizeof];
 			manualAllocator().free(mem);
-		} catch( Throwable th ){
-			logWarn("Exception in lev_free: %s", th.msg);
+		} catch (UncaughtException th) {
+			logCritical("Exception in lev_free: %s", th.msg);
+			assert(false);
 		}
 	}
 
@@ -1057,7 +1054,7 @@ private nothrow extern(C)
 			debug if (!s_mutexesLock) s_mutexesLock = new Mutex;
 			debug synchronized (s_mutexesLock) s_mutexes[cast(void*)ret] = 0;
 			return ret;
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_alloc_mutex: %s", th.msg);
 			return null;
 		}
@@ -1078,8 +1075,9 @@ private nothrow extern(C)
 			if (lm.mutex) MutexAlloc.free(lm.mutex);
 			if (lm.rwmutex) ReadWriteMutexAlloc.free(lm.rwmutex);
 			LevMutexAlloc.free(lm);
-		} catch( Throwable th ){
-			logWarn("Exception in lev_free_mutex: %s", th.msg);
+		} catch (UncaughtException th) {
+			logCritical("Exception in lev_free_mutex: %s", th.msg);
+			assert(false);
 		}
 	}
 
@@ -1108,7 +1106,7 @@ private nothrow extern(C)
 				else mtx.mutex.lock();
 			}
 			return 0;
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_lock_mutex: %s", th.msg);
 			return -1;
 		}
@@ -1135,7 +1133,7 @@ private nothrow extern(C)
 				mtx.mutex.unlock();
 			}
 			return 0;
-		} catch( Throwable th ){
+		} catch (UncaughtException th ) {
 			logWarn("Exception in lev_unlock_mutex: %s", th.msg);
 			return -1;
 		}
@@ -1145,7 +1143,7 @@ private nothrow extern(C)
 	{
 		try {
 			return LevConditionAlloc.alloc();
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_alloc_condition: %s", th.msg);
 			return null;
 		}
@@ -1157,8 +1155,9 @@ private nothrow extern(C)
 			auto lc = cast(LevCondition*)cond;
 			if (lc.cond) ConditionAlloc.free(lc.cond);
 			LevConditionAlloc.free(lc);
-		} catch( Throwable th ){
-			logWarn("Exception in lev_free_condition: %s", th.msg);
+		} catch (UncaughtException th) {
+			logCritical("Exception in lev_free_condition: %s", th.msg);
+			assert(false);
 		}
 	}
 
@@ -1168,7 +1167,7 @@ private nothrow extern(C)
 			auto c = cast(LevCondition*)cond;
 			if( c.cond ) c.cond.notifyAll();
 			return 0;
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_signal_condition: %s", th.msg);
 			return -1;
 		}
@@ -1187,7 +1186,7 @@ private nothrow extern(C)
 					return 1;
 			} else c.cond.wait();
 			return 0;
-		} catch( Throwable th ){
+		} catch (UncaughtException th) {
 			logWarn("Exception in lev_wait_condition: %s", th.msg);
 			return -1;
 		}
@@ -1196,7 +1195,7 @@ private nothrow extern(C)
 	c_ulong lev_get_thread_id()
 	{
 		try return cast(c_ulong)cast(void*)Thread.getThis();
-		catch( Throwable th ){
+		catch (UncaughtException th) {
 			logWarn("Exception in lev_get_thread_id: %s", th.msg);
 			return 0;
 		}

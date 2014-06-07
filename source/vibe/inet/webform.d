@@ -23,7 +23,7 @@ import std.string;
 /**
 	Parses the form given by content_type and body_reader.
 */
-bool parseFormData(ref FormFields fields, ref FilePart[string] files, string content_type, InputStream body_reader, size_t max_line_length)
+bool parseFormData(ref FormFields fields, ref FilePartFormFields files, string content_type, InputStream body_reader, size_t max_line_length)
 {
 	auto ct_entries = content_type.split(";");
 	if (!ct_entries.length) return false;
@@ -78,9 +78,6 @@ void parseURLEncodedForm(string str, ref FormFields params)
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use parseURLEncodedForm instead.") alias parseUrlEncodedForm = parseURLEncodedForm;
-
 unittest
 {
 	FormFields dst;
@@ -99,7 +96,7 @@ unittest
 	If any _files are contained in the form, they are written to temporary _files using
 	vibe.core.file.createTempFile and returned in the files field.
 */
-void parseMultiPartForm(ref FormFields fields, ref FilePart[string] files,
+void parseMultiPartForm(ref FormFields fields, ref FilePartFormFields files,
 	string content_type, InputStream body_reader, size_t max_line_length)
 {
 	auto pos = content_type.indexOf("boundary=");			
@@ -111,7 +108,8 @@ void parseMultiPartForm(ref FormFields fields, ref FilePart[string] files,
 	while (parseMultipartFormPart(body_reader, fields, files, "\r\n--" ~ boundary, max_line_length)) {}
 }
 
-alias FormFields = DictionaryList!(string, true);
+alias FormFields = DictionaryList!(string, true, 16);
+alias FilePartFormFields = DictionaryList!(FilePart, true, 1);
 
 struct FilePart {
 	InetHeaderMap headers;
@@ -120,7 +118,7 @@ struct FilePart {
 }
 
 
-private bool parseMultipartFormPart(InputStream stream, ref FormFields form, ref FilePart[string] files, string boundary, size_t max_line_length)
+private bool parseMultipartFormPart(InputStream stream, ref FormFields form, ref FilePartFormFields files, string boundary, size_t max_line_length)
 {
 	InetHeaderMap headers;
 	stream.parseRFC5322Header(headers);
@@ -153,7 +151,7 @@ private bool parseMultipartFormPart(InputStream stream, ref FormFields form, ref
 		logDebug("file: %s", fp.tempPath.toString());
 		file.close();
 
-		files[name] = fp;
+		files.addField(name, fp);
 
 		// TODO: temp files must be deleted after the request has been processed!
 	} else {

@@ -13,6 +13,7 @@ import vibe.inet.message;
 import vibe.stream.operations;
 import vibe.stream.ssl;
 
+import std.algorithm : map, splitter;
 import std.base64;
 import std.conv;
 import std.exception;
@@ -27,9 +28,6 @@ enum SMTPConnectionType {
 	ssl,
 	startTLS
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use SMTPConnectionType instead.") alias SmtpConnectionType = SMTPConnectionType;
 
 
 /** Represents the different status codes for SMTP replies.
@@ -62,9 +60,6 @@ enum SMTPStatus {
 	transactionFailed = 554
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use SMTPStatus instead.") alias SmtpStatus = SMTPStatus;
-
 
 /**
 	Represents the authentication mechanism used by the SMTP client.
@@ -76,19 +71,18 @@ enum SMTPAuthType {
 	cramMd5
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use SMTPAuthType instead.") alias SmtpAuthType = SMTPAuthType;
-
 
 /**
 	Configuration options for the SMTP client.
 */
-class SMTPClientSettings {
+final class SMTPClientSettings {
 	string host = "127.0.0.1";
 	ushort port = 25;
 	string localname = "localhost";
 	SMTPConnectionType connectionType = SMTPConnectionType.plain;
 	SMTPAuthType authType = SMTPAuthType.none;
+	SSLPeerValidationMode sslValidationMode = SSLPeerValidationMode.trustedCert;
+	void delegate(scope SSLContext) sseContextSetup;
 	string username;
 	string password;
 
@@ -96,14 +90,11 @@ class SMTPClientSettings {
 	this(string host, ushort port) { this.host = host; this.port = port; }
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use SMTPClientSettings instead.") alias SmtpClientSettings = SMTPClientSettings;
-
 
 /**
 	Represents an email message, including its headers.
 */
-class Mail {
+final class Mail {
 	InetHeaderMap headers;
 	string bodyText;
 }
@@ -124,6 +115,13 @@ void sendMail(SMTPClientSettings settings, Mail mail)
 
 	Stream conn = raw_conn;
 
+	if( settings.connectionType == SMTPConnectionType.ssl ){
+		auto ctx = createSSLContext(SSLContextKind.client);
+		ctx.peerValidationMode = settings.sslValidationMode;
+		if (settings.sseContextSetup) settings.sseContextSetup(ctx);
+		conn = createSSLStream(raw_conn, ctx, SSLStreamState.connecting);
+	}
+
 	expectStatus(conn, SMTPStatus.serviceReady, "connection establishment");
 
 	void greet(){
@@ -140,18 +138,14 @@ void sendMail(SMTPClientSettings settings, Mail mail)
 		}
 	}
 
-	if( settings.connectionType == SMTPConnectionType.ssl ){
-		auto ctx = new SSLContext(SSLContextKind.client);
-		conn = new SSLStream(raw_conn, ctx, SSLStreamState.connecting);
-	}
-
 	greet();
 
 	if( settings.connectionType == SMTPConnectionType.startTLS ){
 		conn.write("STARTTLS\r\n");
 		expectStatus(conn, SMTPStatus.serviceReady, "STARTTLS");
-		auto ctx = new SSLContext(SSLContextKind.client);
-		conn = new SSLStream(raw_conn, ctx, SSLStreamState.connecting);
+		auto ctx = createSSLContext(SSLContextKind.client);
+		ctx.peerValidationMode = settings.sslValidationMode;
+		conn = createSSLStream(raw_conn, ctx, SSLStreamState.connecting);
 		greet();
 	}
 
@@ -181,8 +175,17 @@ void sendMail(SMTPClientSettings settings, Mail mail)
 	conn.write("MAIL FROM:"~addressMailPart(mail.headers["From"])~"\r\n");
 	expectStatus(conn, SMTPStatus.success, "MAIL FROM");
 
-	conn.write("RCPT TO:"~addressMailPart(mail.headers["To"])~"\r\n"); // TODO: support multiple recipients
-	expectStatus(conn, SMTPStatus.success, "RCPT TO");
+	static immutable rcpt_headers = ["To", "Cc", "Bcc"];
+	foreach (h; rcpt_headers) {
+		mail.headers.getAll(h, (v) {
+			foreach (a; v.splitter(',').map!(a => a.strip)) {
+				conn.write("RCPT TO:"~addressMailPart(a)~"\r\n");
+				expectStatus(conn, SMTPStatus.success, "RCPT TO");
+			}
+		});
+	}
+
+	mail.headers.removeAll("Bcc");
 
 	conn.write("DATA\r\n");
 	expectStatus(conn, SMTPStatus.startMailInput, "DATA");

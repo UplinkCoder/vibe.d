@@ -8,12 +8,15 @@
 
 module vibe.internal.meta.uda;
 
+//import vibe.internal.meta.traits;
+
+
 /**
 	Small convenience wrapper to find and extract certain UDA from given type.
 	Will stop on first element which is of required type.
 
 	Params:
-		UDA = type to search for in UDA list
+		UDA = type or template to search for in UDA list
 		Symbol = symbol to query for UDA's
 		allow_types = if set to `false` considers attached `UDA` types an error
 			(only accepts instances/values)
@@ -22,9 +25,10 @@ module vibe.internal.meta.uda;
 		`found` is boolean flag for having a valid find. `index` is integer index in
 		attribute list this UDA was found at.
 */
-template findFirstUDA(UDA, alias Symbol, bool allow_types = false)
+template findFirstUDA(alias UDA, alias Symbol, bool allow_types = false)
 {
 	import std.typetuple : TypeTuple;
+	import std.traits : isInstanceOf;
 
     private alias TypeTuple!(__traits(getAttributes, Symbol)) udaTuple;
 
@@ -37,32 +41,66 @@ template findFirstUDA(UDA, alias Symbol, bool allow_types = false)
 
     private template extract(size_t index, list...)
     {
-        static if (!list.length)
-            enum extract = UdaSearchResult!(null)(false, -1);
+        static if (!list.length) enum extract = UdaSearchResult!(null)(false, -1);
         else {
-			static if (is(list[0] == UDA)) {
-				static assert (allow_types, "findFirstUDA is designed to look up values, not types");
-
-				enum extract = UdaSearchResult!(list[0])(true, index);
-			}
-			else {
-				static if (is(typeof(list[0]) == UDA)) {
+        	static if (is(list[0])) {
+				static if (is(UDA) && is(list[0] == UDA) || !is(UDA) && isInstanceOf!(UDA, list[0])) {
+					static assert (allow_types, "findFirstUDA is designed to look up values, not types");
+					enum extract = UdaSearchResult!(list[0])(true, index);
+				} else enum extract = extract!(index + 1, list[1..$]);
+        	} else {
+				static if (is(UDA) && is(typeof(list[0]) == UDA) || !is(UDA) && isInstanceOf!(UDA, typeof(list[0]))) {
 					import vibe.internal.meta.traits : isPropertyGetter;
 					static if (isPropertyGetter!(list[0])) {
 						enum value = list[0];
 						enum extract = UdaSearchResult!(value)(true, index);
-					}
-					else
-						enum extract = UdaSearchResult!(list[0])(true, index);
-				}
-				else
-					enum extract = extract!(index + 1, list[1..$]);
+					} else enum extract = UdaSearchResult!(list[0])(true, index);
+				} else enum extract = extract!(index + 1, list[1..$]);
 			}
 		}
     }
 
     enum findFirstUDA = extract!(0, udaTuple);
 }
+/// ditto
+template findFirstUDA(UDA, alias Symbol, bool allow_types = false)
+{
+	import std.typetuple : TypeTuple;
+	import std.traits : isInstanceOf;
+
+    private alias TypeTuple!(__traits(getAttributes, Symbol)) udaTuple;
+
+	private struct UdaSearchResult(alias UDA)
+	{
+		alias value = UDA;
+		bool found = false;
+		long index = -1;
+	}
+
+    private template extract(size_t index, list...)
+    {
+        static if (!list.length) enum extract = UdaSearchResult!(null)(false, -1);
+        else {
+        	static if (is(list[0])) {
+				static if (is(list[0] == UDA)) {
+					static assert (allow_types, "findFirstUDA is designed to look up values, not types");
+					enum extract = UdaSearchResult!(list[0])(true, index);
+				} else enum extract = extract!(index + 1, list[1..$]);
+        	} else {
+				static if (is(typeof(list[0]) == UDA)) {
+					import vibe.internal.meta.traits : isPropertyGetter;
+					static if (isPropertyGetter!(list[0])) {
+						enum value = list[0];
+						enum extract = UdaSearchResult!(value)(true, index);
+					} else enum extract = UdaSearchResult!(list[0])(true, index);
+				} else enum extract = extract!(index + 1, list[1..$]);
+			}
+		}
+    }
+
+    enum findFirstUDA = extract!(0, udaTuple);
+}
+
 
 ///
 unittest
@@ -103,16 +141,17 @@ unittest
 unittest
 {
     struct Attribute { int x; }
+    enum Dummy;
 
 	@property static Attribute getter()
 	{
 		return Attribute(42);
 	}
 
-	@getter void symbol();
+	@Dummy @getter void symbol();
 
 	enum result0 = findFirstUDA!(Attribute, symbol);
 	static assert (result0.found);
-	static assert (result0.index == 0);
+	static assert (result0.index == 1);
 	static assert (result0.value == Attribute(42));
 }

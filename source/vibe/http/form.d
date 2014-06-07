@@ -220,7 +220,6 @@ private HTTPServerRequestDelegate formMethodHandler(T, string method)(T inst, Fl
 	void handler(HTTPServerRequest req, HTTPServerResponse res)
 	{
 		import std.traits;
-		string[string] form = req.method == HTTPMethod.GET ? req.query : req.form;
 //		alias MemberFunctionsTuple!(T, method) overloads;
 		string errors;
 		foreach(func; __traits(getOverloads, T, method)) {
@@ -291,8 +290,8 @@ private bool applyParametersFromAssociativeArray(Func)(HTTPServerRequest req, HT
 private bool applyParametersFromAssociativeArray(alias Overload, Func)(HTTPServerRequest req, HTTPServerResponse res, Func func, out string error, Flag!"strict" strict) {
 	alias ParameterTypeTuple!Overload ParameterTypes;
 	ParameterTypes args;
-	string[string] form = req.method == HTTPMethod.GET ? req.query : req.form;
-	int count=0;
+	auto form = (req.method == HTTPMethod.GET ? req.query : req.form);
+	int count = 0;
 	Error e;
 	foreach(i, item; ParameterIdentifierTuple!Overload) {
 		static if(is(ParameterTypes[i] : HTTPServerRequest)) {
@@ -308,7 +307,9 @@ private bool applyParametersFromAssociativeArray(alias Overload, Func)(HTTPServe
 	error=e.message;
 	if(e.missing_parameters.length) {
 		error~="The following parameters have not been found in the form data: "~to!string(e.missing_parameters)~"\n";
-		error~="Provided form data was: "~to!string(form.keys)~"\n";
+		error~="Provided form data was: ";
+                foreach(k, v; form)
+                    error ~= "[" ~ k ~ ":" ~ v ~ "] ";
 	}
 	if(count!=form.length) {
 		error~="The form had "~to!string(form.length)~" element(s), of which "~to!string(count)~" element(s) were applicable.\n";
@@ -578,6 +579,10 @@ private int loadFormDataRecursiveSingle(T)(FormFields form, ref T elem, string f
 }
 
 unittest {
+	enum E {
+		someValue,
+		someOtherValue
+	}
 	struct Test1 {
 		int a;
 		float b;
@@ -588,6 +593,7 @@ unittest {
 		int[] c;
 		Test1[] d;
 		Test1 e;
+		E f;
 	}
 	
 	Test t;
@@ -603,6 +609,7 @@ unittest {
 	form["t_d0_a"] = "6";
 	form["t_d0_b"] = "7";
 	form["t_d1_a"] = "9";
+	form["t_f"] = "someOtherValue";
 
 	Error e;
 	assert(loadFormDataRecursive(form, t, "t", e, No.strict)==form.length);
@@ -614,4 +621,5 @@ unittest {
 	assert(t.d[0].a==6);
 	assert(t.d[0].b==7);
 	assert(t.d[1].a==9);
+	assert(t.f == E.someOtherValue);
 }

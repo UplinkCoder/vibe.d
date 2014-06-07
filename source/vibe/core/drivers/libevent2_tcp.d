@@ -1,7 +1,7 @@
 /**
 	libevent based driver
 
-	Copyright: © 2012-2013 RejectedSoftware e.K.
+	Copyright: © 2012-2014 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
@@ -24,6 +24,7 @@ import deimos.event2.event;
 import deimos.event2.util;
 
 import std.algorithm;
+import std.encoding : sanitize;
 import std.exception;
 import std.conv;
 import std.string;
@@ -52,13 +53,14 @@ private {
 	}
 }
 
-package class Libevent2TCPConnection : TCPConnection {
+package final class Libevent2TCPConnection : TCPConnection {
 	private {
 		bool m_timeout_triggered;
 		TCPContext* m_ctx;
 		string m_peerAddress;
 		ubyte[64] m_peekBuffer;
 		bool m_tcpNoDelay = false;
+		bool m_tcpKeepAlive = false;
 		Duration m_readTimeout;
 		char[64] m_peerAddressBuf;
 		NetworkAddress m_localAddress, m_remoteAddress;
@@ -111,6 +113,16 @@ package class Libevent2TCPConnection : TCPConnection {
 	}
 	@property Duration readTimeout() const { return m_readTimeout; }
 
+	@property void keepAlive(bool enable)
+	{
+		m_tcpKeepAlive = enable;
+		auto fd = m_ctx.socketfd;
+		ubyte opt = enable;
+		assert(fd <= int.max, "Socket descriptor > int.max");
+		setsockopt(cast(int)fd, SOL_SOCKET, SO_KEEPALIVE, &opt, opt.sizeof);
+	}
+	@property bool keepAlive() const { return m_tcpKeepAlive; }
+
 	@property NetworkAddress localAddress() const { return m_localAddress; }
 	@property NetworkAddress remoteAddress() const { return m_remoteAddress; }
 
@@ -140,8 +152,21 @@ package class Libevent2TCPConnection : TCPConnection {
 		if (!m_ctx) return;
 		acquire();
 
+		scope (exit) {
+			TCPContextAlloc.free(m_ctx);
+			m_ctx = null;
+		}
+
 		if (m_ctx.event) {
 			auto fd = m_ctx.socketfd;
+
+			scope (exit) {
+				version(Windows) shutdown(m_ctx.socketfd, SD_SEND);
+				else shutdown(m_ctx.socketfd, SHUT_WR);
+				if (m_ctx.event) bufferevent_free(m_ctx.event);
+				logTrace("...socket %d closed.", fd);
+			}
+
 			m_ctx.shutdown = true;
 			bufferevent_setwatermark(m_ctx.event, EV_WRITE, 1, 0);
 			bufferevent_flush(m_ctx.event, EV_WRITE, bufferevent_flush_mode.BEV_FINISHED);
@@ -149,14 +174,7 @@ package class Libevent2TCPConnection : TCPConnection {
 			auto buf = bufferevent_get_output(m_ctx.event);
 			while (m_ctx.event && evbuffer_get_length(buf) > 0)
 				m_ctx.core.yieldForEvent();
-
-			version(Windows) shutdown(m_ctx.socketfd, SD_SEND);
-			else shutdown(m_ctx.socketfd, SHUT_WR);
-			if (m_ctx.event) bufferevent_free(m_ctx.event);
-			logTrace("...socket %d closed.", fd);
 		}
-		TCPContextAlloc.free(m_ctx);
-		m_ctx = null;
 	}
 
 	/// The 'connected' status of this connection
@@ -357,7 +375,7 @@ package class Libevent2TCPConnection : TCPConnection {
 	}
 }
 
-class LibeventTCPListener : TCPListener {
+final class Libevent2TCPListener : TCPListener {
 	private {
 		TCPContext*[] m_ctx;
 	}
@@ -404,6 +422,13 @@ package struct TCPContext
 		event = evt;
 	}
 
+	void checkForException() {
+		if (auto ex = this.exception) {
+			this.exception = null;
+			throw ex;
+		}
+	}
+
 	DriverCore core;
 	event_base* eventLoop;
 	void delegate(TCPConnection conn) connectionCallback;
@@ -417,6 +442,8 @@ package struct TCPContext
 	bool eof = false; // remomte has hung up
 	Task readOwner;
 	Task writeOwner;
+	Exception exception; // set during onSocketEvent calls that were emitted synchronously
+	TCPListenOptions listenOptions;
 }
 alias FreeListObjectAlloc!(TCPContext, false, true) TCPContextAlloc;
 
@@ -427,6 +454,9 @@ alias FreeListObjectAlloc!(TCPContext, false, true) TCPContextAlloc;
 
 package nothrow extern(C)
 {
+	version (VibeDebugCatchAll) alias UncaughtException = Throwable;
+	else alias UncaughtException = Exception;
+
 	void onConnect(evutil_socket_t listenfd, short evtype, void *arg)
 	{
 		logTrace("connect callback");
@@ -442,6 +472,7 @@ package nothrow extern(C)
 			NetworkAddress bind_addr;
 			NetworkAddress remote_addr;
 			int sockfd;
+			TCPListenOptions options;
 
 			void execute()
 			{
@@ -477,14 +508,14 @@ package nothrow extern(C)
 				try {
 					listen_ctx.connectionCallback(conn);
 					logDebug("task out (fd %d).", client_ctx.socketfd);
-				} catch( Exception e ){
+				} catch (Exception e) {
 					logWarn("Handling of connection failed: %s", e.msg);
 					logDiagnostic("%s", e.toString().sanitize);
+				} finally {
+					logDebug("task finished.");
+					FreeListObjectAlloc!ClientTask.free(&this);
+					if (!(options & TCPListenOptions.disableAutoClose)) conn.close();
 				}
-				conn.close();
-
-				FreeListObjectAlloc!ClientTask.free(&this);
-				logDebug("task finished.");
 			}
 		}
 
@@ -517,15 +548,11 @@ package nothrow extern(C)
 				task.bind_addr = ctx.local_addr;
 				*cast(sockaddr_in6*)task.remote_addr.sockAddr = remote_addr;
 				task.sockfd = sockfd;
+				task.options = ctx.listenOptions;
 
-				version(MultiThreadTest){
-					runWorkerTask(&task.execute);
-				} else {
-logDebug("running task");
-					runTask(&task.execute);
-				}
+				runTask(&task.execute);
 			}
-		} catch (Throwable e) {
+		} catch (UncaughtException e) {
 			logWarn("Got exception while accepting new connections: %s", e.msg);
 			try logDebug("Full error: %s", e.toString().sanitize());
 			catch {}
@@ -543,7 +570,7 @@ logDebug("running task");
 		try {
 			if (f && f.running)
 				ctx.core.resumeTask(f);
-		} catch( Throwable e ){
+		} catch (UncaughtException e) {
 			logWarn("Got exception when resuming task onSocketRead: %s", e.msg);
 		}
 	}
@@ -558,7 +585,7 @@ logDebug("running task");
 				bufferevent_flush(buf_event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
 			}
 			if (ctx.writeOwner) ctx.core.resumeTask(ctx.writeOwner);
-		} catch( Throwable e ){
+		} catch (UncaughtException e) {
 			logWarn("Got exception when resuming task onSocketRead: %s", e.msg);
 		}
 	}
@@ -600,13 +627,15 @@ logDebug("running task");
 
 			if (ctx.readOwner && ctx.readOwner.running) {
 				logTrace("resuming corresponding task%s...", ex is null ? "" : " with exception");
-				ctx.core.resumeTask(ctx.readOwner, ex);
+				if (ctx.readOwner.fiber.state == Fiber.State.EXEC) ctx.exception = ex;
+				else ctx.core.resumeTask(ctx.readOwner, ex);
 			}
 			if (ctx.writeOwner && ctx.writeOwner != ctx.readOwner && ctx.writeOwner.running) {
 				logTrace("resuming corresponding task%s...", ex is null ? "" : " with exception");
-				ctx.core.resumeTask(ctx.writeOwner, ex);
+				if (ctx.writeOwner.fiber.state == Fiber.State.EXEC) ctx.exception = ex;
+				else ctx.core.resumeTask(ctx.writeOwner, ex);
 			}
-		} catch( Throwable e ){
+		} catch (UncaughtException e) {
 			logWarn("Got exception when resuming task onSocketEvent: %s", e.msg);
 			try logDiagnostic("Full error: %s", e.toString().sanitize); catch {}
 		}
@@ -620,7 +649,7 @@ logDebug("running task");
 			conn.m_timeout_triggered = true;
 			if( conn.m_ctx ) conn.m_ctx.core.resumeTask(conn.m_ctx.readOwner);
 			else logDebug("waitForData timeout after connection was closed!");
-		} catch( Throwable e ){
+		} catch (UncaughtException e) {
 			logWarn("Exception onTimeout: %s", e.msg);
 		}
 	}

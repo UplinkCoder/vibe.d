@@ -14,7 +14,7 @@ shared long nreqc = 1000;
 shared long ndisconns = 0;
 shared long nconn = 0;
 
-shared long g_concurrency = 1;
+shared long g_concurrency = 100;
 shared long g_requestDelay = 0;
 shared long g_maxKeepAliveRequests = 1000;
 
@@ -45,7 +45,7 @@ void distTask()
 {
 	static shared int s_threadCount = 0;
 	static shared int s_token = 0;
-	auto id = atomicOp!"+="(s_threadCount, 1) - 1;
+	int id = atomicOp!"+="(s_threadCount, 1) - 1;
 	
 	while (true) {
 		while (atomicLoad(s_token) != id && g_concurrency > 0) {}
@@ -58,14 +58,14 @@ void distTask()
 				if (disconnect) keep_alives = 0;
 			}
 		});
-		g_concurrency--;
-		atomicStore(s_token, (id + 1) % workerThreadCount);
+		atomicOp!"+="(g_concurrency, -1);
+		atomicStore(s_token, cast(int)((id + 1) % workerThreadCount));
 	}
 }
 
 void benchmark()
 {
-	g_concurrency--;
+	atomicOp!"+="(g_concurrency, -1);
 	if (g_concurrency > 0) {
 		runWorkerTaskDist(&distTask);
 		while (atomicLoad(nreq) == 0) { sleep(1.msecs); }
@@ -86,6 +86,7 @@ void benchmark()
 		bool disconnect = ++keep_alives >= g_maxKeepAliveRequests;
 		request(disconnect);
 		if (disconnect) keep_alives = 0;
+//                if (nreq >= 5000) exitEventLoop(true);
 	}
 }
 
@@ -96,7 +97,6 @@ void main()
 	getOption("d", &g_requestDelay, "Artificial request delay in milliseconds");
 	getOption("k", &g_maxKeepAliveRequests, "Maximum number of keep-alive requests for each connection");
 	if (!finalizeCommandLineOptions()) return;
-	enableWorkerThreads();
 	runTask(toDelegate(&benchmark));
 	runEventLoop();
 }

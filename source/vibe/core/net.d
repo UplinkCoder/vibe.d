@@ -1,7 +1,7 @@
 /**
 	TCP/UDP connection and server handling.
 
-	Copyright: © 2012 RejectedSoftware e.K.
+	Copyright: © 2012-2014 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
@@ -59,9 +59,6 @@ TCPListener listenTCP(ushort port, void delegate(TCPConnection stream) connectio
 	return getEventDriver().listenTCP(port, connection_callback, address, options);
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use listenTCP instead.") alias listenTcp = listenTCP;
-
 /**
 	Starts listening on the specified port.
 
@@ -77,9 +74,6 @@ TCPListener listenTCP_s(ushort port, void function(TCPConnection stream) connect
 	return listenTCP(port, toDelegate(connection_callback), address, options);
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use listenTCP_s instead.") alias listenTcpS = listenTCP_s;
-
 /**
 	Establishes a connection to the given host/port.
 */
@@ -94,9 +88,6 @@ TCPConnection connectTCP(NetworkAddress addr) {
 	return getEventDriver().connectTCP(addr);
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use connectTCP instead.")alias connectTcp = connectTCP;
-
 
 /**
 	Creates a bound UDP socket suitable for sending and receiving packets.
@@ -105,9 +96,6 @@ UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
 {
 	return getEventDriver().listenUDP(port, bind_address);
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use listenUDP instead.")alias listenUdp = listenUDP;
 
 
 /**
@@ -174,7 +162,8 @@ struct NetworkAddress {
 	string toAddressString()
 	const {
 		import std.array : appender;
-		import std.string : format, formattedWrite;
+		import std.string : format;
+		import std.format : formattedWrite;
 
 		switch (this.family) {
 			default: assert(false, "toAddressString() called for invalid address family.");
@@ -226,6 +215,12 @@ interface TCPConnection : ConnectionStream {
 	/// ditto
 	@property bool tcpNoDelay() const;
 
+
+	/// Enables TCP keep-alive packets.
+	@property void keepAlive(bool enable);
+	/// ditto
+	@property bool keepAlive() const;
+
 	/// Controls the read time out after which the connection is closed automatically.
 	@property void readTimeout(Duration duration);
 	/// ditto
@@ -241,9 +236,6 @@ interface TCPConnection : ConnectionStream {
 	@property NetworkAddress remoteAddress() const;
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use TCPConnection instead.")alias TcpConnection = TCPConnection;
-
 
 /**
 	Represents a listening TCP socket.
@@ -252,9 +244,6 @@ interface TCPListener {
 	/// Stops listening and closes the socket.
 	void stopListening();
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use TCPListener instead.")alias TcpListener = TCPListener;
 
 
 /**
@@ -293,21 +282,27 @@ interface UDPConnection {
 	/** Receives a single packet.
 
 		If a buffer is given, it must be large enough to hold the full packet.
+
+		The timeout overload will throw an Exception if no data arrives before the
+		specified duration has elapsed.
 	*/
 	ubyte[] recv(ubyte[] buf = null, NetworkAddress* peer_address = null);
+	/// ditto
+	ubyte[] recv(Duration timeout, ubyte[] buf = null, NetworkAddress* peer_address = null);
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use UDPConnection instead.")alias UdpConnection = UDPConnection;
 
-
+/**
+	Flags to control the behavior of listenTCP.
+*/
 enum TCPListenOptions {
+	/// Don't enable any particular option
 	defaults = 0,
-	distribute = 1<<0
+	/// Causes incoming connections to be distributed across the thread pool
+	distribute = 1<<0,
+	/// Disables automatic closing of the connection when the connection callback exits
+	disableAutoClose = 1<<1,
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use TCPListenOptions instead.")alias TcpListenOptions = TCPListenOptions;
 
 private pure nothrow {
 	import std.bitmanip;

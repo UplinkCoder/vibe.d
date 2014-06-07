@@ -1,7 +1,7 @@
 /**
 	MongoCollection class
 
-	Copyright: © 2012 RejectedSoftware e.K.
+	Copyright: © 2012-2014 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -100,7 +100,8 @@ struct MongoCollection {
 	{
 		assert(m_client !is null, "Updating uninitialized MongoCollection.");
 		auto conn = m_client.lockConnection();
-		conn.update(m_fullPath, flags, serializeToBson(selector), serializeToBson(update));
+		ubyte[256] selector_buf = void, update_buf = void;
+		conn.update(m_fullPath, flags, serializeToBson(selector, selector_buf), serializeToBson(update, update_buf));
 	}
 
 	/**
@@ -116,7 +117,7 @@ struct MongoCollection {
 		Bson[] docs;
 		Bson bdocs = serializeToBson(document_or_documents);
 		if( bdocs.type == Bson.Type.Array ) docs = cast(Bson[])bdocs;
-		else docs ~= bdocs;
+		else docs = (&bdocs)[0 .. 1];
 		conn.insert(m_fullPath, flags, docs);
 	}
 
@@ -127,41 +128,51 @@ struct MongoCollection {
 
 	  See_Also: $(LINK http://www.mongodb.org/display/DOCS/Querying)
 	 */
-	MongoCursor find(T, U)(T query, U returnFieldSelector, QueryFlags flags = QueryFlags.None, int num_skip = 0, int num_docs_per_chunk = 0)
+	MongoCursor!(T, R, U) find(R = Bson, T, U)(T query, U returnFieldSelector, QueryFlags flags = QueryFlags.None, int num_skip = 0, int num_docs_per_chunk = 0)
 	{
 		assert(m_client !is null, "Querying uninitialized MongoCollection.");
-		static if( is(typeof(returnFieldSelector is null)) )
-			return MongoCursor(m_client, m_fullPath, flags, num_skip, num_docs_per_chunk, serializeToBson(query), returnFieldSelector is null ? Bson(null) : serializeToBson(returnFieldSelector));
-		else
-			return MongoCursor(m_client, m_fullPath, flags, num_skip, num_docs_per_chunk, serializeToBson(query), serializeToBson(returnFieldSelector));
+		return MongoCursor!(T, R, U)(m_client, m_fullPath, flags, num_skip, num_docs_per_chunk, query, returnFieldSelector);
 	}
 
 	/// ditto
-	MongoCursor find(T)(T query) { return find(query, null); }
+	MongoCursor!(T, R, typeof(null)) find(R = Bson, T)(T query) { return find!R(query, null); }
 
 	/// ditto
-	MongoCursor find()() { return find(Bson.EmptyObject, null); }
+	MongoCursor!(Bson, R, typeof(null)) find(R = Bson)() { return find!R(Bson.emptyObject, null); }
 
-	/**
-	  Queries the collection for existing documents.
+	/** Queries the collection for existing documents.
 
-	  Returns: the first match or null
-	  Throws: Exception if a DB communication error or a query error occured.
-	  See_Also: $(LINK http://www.mongodb.org/display/DOCS/Querying)
+		Returns:
+			By default, a Bson value of the matching document is returned, or $(D Bson(null))
+			when no document matched. For types R that are not Bson, the returned value is either
+			of type $(D R), or of type $(Nullable!R), if $(D R) is not a reference/pointer type.
+		
+		Throws: Exception if a DB communication error or a query error occured.
+		See_Also: $(LINK http://www.mongodb.org/display/DOCS/Querying)
 	 */
-	Bson findOne(T, U)(T query, U returnFieldSelector, QueryFlags flags = QueryFlags.None)
+	auto findOne(R = Bson, T, U)(T query, U returnFieldSelector, QueryFlags flags = QueryFlags.None)
 	{
-		auto c = find(query, returnFieldSelector, flags, 0, 1);
-		foreach( doc; c ) return doc;
-		return Bson(null);
+		import std.traits;
+		import std.typecons;
+
+		auto c = find!R(query, returnFieldSelector, flags, 0, 1);
+		static if (is(R == Bson)) {
+			foreach (doc; c) return doc;
+			return Bson(null);
+		} else static if (is(R == class) || isPointer!R || isDynamicArray!R || isAssociativeArray!R) {
+			foreach (doc; c) return doc;
+			return null;
+		} else {
+			foreach (doc; c) {
+				Nullable!R ret;
+				ret = doc;
+				return ret;
+			}
+			return Nullable!R.init;
+		}
 	}
 	/// ditto
-	Bson findOne(T)(T query)
-	{
-		auto c = find(query, null, QueryFlags.None, 0, 1);
-		foreach( doc; c ) return doc;
-		return Bson(null);
-	}
+	auto findOne(R = Bson, T)(T query) { return findOne!R(query, Bson(null)); }
 
 	/**
 	  Removes documents from the collection.
@@ -173,11 +184,12 @@ struct MongoCollection {
 	{
 		assert(m_client !is null, "Removnig from uninitialized MongoCollection.");
 		auto conn = m_client.lockConnection();
-		conn.delete_(m_fullPath, flags, serializeToBson(selector));
+		ubyte[256] selector_buf = void;
+		conn.delete_(m_fullPath, flags, serializeToBson(selector, selector_buf));
 	}
 
 	/// ditto
-	void remove()() { remove(Bson.EmptyObject); }
+	void remove()() { remove(Bson.emptyObject); }
 
 	/**
 	  Combines a modify and find operation to a single atomic operation.
@@ -187,12 +199,17 @@ struct MongoCollection {
 	 */
 	Bson findAndModify(T, U, V)(T query, U update, V returnFieldSelector)
 	{
-		Bson cmd = Bson.EmptyObject;
-		cmd["findAndModify"] = Bson(m_name);
-		cmd["query"] = serializeToBson(query);
-		cmd["update"] = serializeToBson(update);
-		if( returnFieldSelector != null )
-			cmd["fields"] = serializeToBson(returnFieldSelector);
+		static struct CMD {
+			string findAndModify;
+			T query;
+			U update;
+			V fields;
+		}
+		CMD cmd;
+		cmd.findAndModify = m_name;
+		cmd.query = query;
+		cmd.update = update;
+		cmd.fields = returnFieldSelector;
 		auto ret = database.runCommand(cmd);
 		if( !ret.ok.get!double ) throw new Exception("findAndModify failed.");
 		return ret.value;
@@ -212,10 +229,16 @@ See_Also: $(LINK http://www.mongodb.org/display/DOCS/Advanced+Queries#AdvancedQu
 	 */
 	ulong count(T)(T query)
 	{
-		Bson cmd = Bson.EmptyObject;
-		cmd["count"] = Bson(m_name);
-		cmd["query"] = serializeToBson(query);
-		cmd["fields"] = Bson.EmptyObject;
+		static struct Empty {}
+		static struct CMD {
+			string count;
+			T query;
+			Empty fields;
+		}
+
+		CMD cmd;
+		cmd.count = m_name;
+		cmd.query = query;
 		auto reply = database.runCommand(cmd);
 		enforce(reply.ok.get!double == 1, "Count command failed.");
 		return cast(ulong)reply.n.get!double;
@@ -234,12 +257,17 @@ See_Also: $(LINK http://www.mongodb.org/display/DOCS/Advanced+Queries#AdvancedQu
 	  See_Also: $(LINK http://docs.mongodb.org/manual/reference/method/db.collection.aggregate)
 	*/
 	Bson aggregate(ARGS...)(ARGS pipeline) {
-		Bson[ARGS.length] nodes;
-		foreach(i, node; pipeline)
-			nodes[i] = serializeToBson(node);
-		Bson cmd = Bson.emptyObject;
-		cmd["aggregate"] = Bson(m_name);
-		cmd["pipeline"] = serializeToBson(nodes);
+		static struct Pipeline {
+			ARGS args;
+		}
+		static struct CMD {
+			string aggregate;
+			@asArray Nodes pipeline;
+		}
+
+		CMD cmd;
+		cmd.aggregate = m_name;
+		cmd.pipeline.args = pipeline;
 		auto ret = database.runCommand(cmd);
 		enforce(ret.ok.get!double == 1, "Aggregate command failed.");
 		return ret.result;

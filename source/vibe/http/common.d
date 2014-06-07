@@ -32,9 +32,6 @@ enum HTTPVersion {
 	HTTP_1_1
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPVersion instead.") alias HttpVersion = HTTPVersion;
-
 
 enum HTTPMethod {
 	// HTTP standard
@@ -57,9 +54,6 @@ enum HTTPMethod {
 	PROPPATCH,
 	UNLOCK
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPMethod instead.") alias HttpMethod = HTTPMethod;
 
 
 /**
@@ -113,9 +107,6 @@ void enforceHTTP(T)(T condition, HTTPStatus statusCode, string message = null)
 	enforce(condition, new HTTPStatusException(statusCode, message));
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use enforceHTTP instead.") alias enforceHttp = enforceHTTP;
-
 
 /**
 	Represents an HTTP request made to a server.
@@ -140,12 +131,6 @@ class HTTPRequest {
 		*/
 		string requestURL = "/";
 
-		/// Deprecated compatibility alias
-		deprecated("Please use requestURL instead.") alias requestUrl = requestURL;
-
-		/// Please use requestURL instead.
-		deprecated("Please use requestURL instead.") alias url = requestURL;
-
 		/// All request _headers
 		InetHeaderMap headers;
 	}
@@ -159,6 +144,10 @@ class HTTPRequest {
 	{
 	}
 
+	public override string toString()
+	{
+		return httpMethodString(method) ~ " " ~ requestURL ~ " " ~ getHTTPVersionString(httpVersion);
+	}
 
 	/** Shortcut to the 'Host' header (always present for HTTP 1.1)
 	*/
@@ -212,11 +201,7 @@ class HTTPRequest {
 				return false;
 		}
 	}
-	
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPRequest instead.") alias HttpRequest = HTTPRequest;
 
 
 /**
@@ -243,15 +228,19 @@ class HTTPResponse {
 		Cookie[string] cookies;
 	}
 
+	public override string toString()
+	{
+		auto app = appender!string();
+		formattedWrite(app, "%s %d %s", getHTTPVersionString(this.httpVersion), this.statusCode, this.statusPhrase);
+		return app.data;
+	}
+
 	/** Shortcut to the "Content-Type" header
 	*/
 	@property string contentType() const { auto pct = "Content-Type" in headers; return pct ? *pct : "application/octet-stream"; }
 	/// ditto
 	@property void contentType(string ct) { headers["Content-Type"] = ct; }
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPResponse instead.") alias HttpResponse = HTTPResponse;
 
 
 /**
@@ -274,11 +263,8 @@ class HTTPStatusException : Exception {
 	@property int status() const { return m_status; }
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPStatusException instead.") alias HttpStatusException = HTTPStatusException;
 
-
-class MultiPart {
+final class MultiPart {
 	string contentType;
 	
 	InputStream stream;
@@ -294,9 +280,6 @@ string getHTTPVersionString(HTTPVersion ver)
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use getHTTPVersionString instead.") alias getHttpVersionString = getHTTPVersionString;
-
 
 HTTPVersion parseHTTPVersion(ref string str)
 {
@@ -310,9 +293,6 @@ HTTPVersion parseHTTPVersion(ref string str)
 	enforce( majorVersion == 1 && (minorVersion == 0 || minorVersion == 1) );
 	return minorVersion == 0 ? HTTPVersion.HTTP_1_0 : HTTPVersion.HTTP_1_1;
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use parseHTTPVersion instead.") alias parseHttpVersion = parseHTTPVersion;
 
 
 /**
@@ -395,7 +375,7 @@ final class ChunkedOutputStream : OutputStream {
 		bool m_finalized = false;
 	}
 	
-	this(OutputStream stream, shared(Allocator) alloc = defaultAllocator())
+	this(OutputStream stream, Allocator alloc = defaultAllocator())
 	{
 		m_out = stream;
 		m_buffer = AllocAppender!(ubyte[])(alloc);
@@ -545,6 +525,7 @@ struct CookieValueMap {
 
 	string opIndex(string name)
 	const {
+		import core.exception : RangeError;
 		auto pv = name in this;
 		if( !pv ) throw new RangeError("Non-existent cookie: "~name);
 		return *pv;

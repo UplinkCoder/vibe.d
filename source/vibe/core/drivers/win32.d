@@ -1,7 +1,7 @@
 /**
 	Win32 driver implementation using WSAAsyncSelect
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012-2014 Sönke Ludwig
 	Authors: Sönke Ludwig, Leonid Kramer
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
@@ -12,6 +12,7 @@ version(VibeWin32Driver)
 
 import vibe.core.core;
 import vibe.core.driver;
+import vibe.core.drivers.timerqueue;
 import vibe.core.drivers.utils;
 import vibe.core.log;
 import vibe.inet.url;
@@ -28,6 +29,7 @@ import std.algorithm;
 import std.conv;
 import std.c.windows.windows;
 import std.c.windows.winsock;
+import std.datetime;
 import std.exception;
 import std.string : lastIndexOf;
 import std.typecons;
@@ -43,7 +45,7 @@ pragma(lib, "ws2_32");
 /* class Win32EventDriver                                                     */
 /******************************************************************************/
 
-class Win32EventDriver : EventDriver {
+final class Win32EventDriver : EventDriver {
 	import std.container : Array, BinaryHeap, heapify;
 	import std.datetime : Clock;
 
@@ -57,10 +59,7 @@ class Win32EventDriver : EventDriver {
 		HANDLE m_fileCompletionEvent;
 		bool[Win32TCPConnection] m_fileWriters;
 
-		int m_timerIDCounter = 1;
-		HashMap!(size_t, TimerInfo) m_timers;
-		Array!TimeoutEntry m_timeoutHeapStore;
-		BinaryHeap!(Array!TimeoutEntry, "a.timeout > b.timeout") m_timeoutHeap;
+		TimerQueue!TimerInfo m_timers;
 	}
 
 	this(DriverCore core)
@@ -79,8 +78,6 @@ class Win32EventDriver : EventDriver {
 
 		m_fileCompletionEvent = CreateEventW(null, false, false, null);
 		m_registeredEvents ~= m_fileCompletionEvent;
-
-		m_timeoutHeap = heapify!"a.timeout > b.timeout"(m_timeoutHeapStore, 0);
 	}
 
 	~this()
@@ -99,7 +96,6 @@ class Win32EventDriver : EventDriver {
 	int runEventLoopOnce()
 	{
 		doProcessEvents(INFINITE);
-		m_core.notifyIdle();
 		return 0;
 	}
 
@@ -129,6 +125,8 @@ class Win32EventDriver : EventDriver {
 			//if (++cnt % 10 == 0) processTimers();
 		}
 
+		if (timeout_msecs != 0) m_core.notifyIdle();
+
 		return true;
 	}
 
@@ -142,9 +140,10 @@ class Win32EventDriver : EventDriver {
 	private void waitForEvents(uint timeout_msecs)
 	{
 		// if timers are pending, limit the wait time to the first timer timeout
-		if (timeout_msecs > 0 && !m_timeoutHeap.empty) {
+		auto next_timer = m_timers.getFirstTimeout();
+		if (timeout_msecs > 0 && next_timer != SysTime.max) {
 			auto now = Clock.currStdTime();
-			auto timer_timeout = (m_timeoutHeap.front.timeout - now) / 10_000;
+			auto timer_timeout = (next_timer.stdTime - now) / 10_000;
 			if (timeout_msecs == INFINITE || timer_timeout < timeout_msecs)
 				timeout_msecs = cast(uint)(timer_timeout < 0 ? 0 : timer_timeout > uint.max ? uint.max : timer_timeout);
 		}
@@ -163,29 +162,14 @@ class Win32EventDriver : EventDriver {
 	private void processTimers()
 	{
 		// process all timers that have expired up to now
-		auto now = Clock.currStdTime();
-		while (!m_timeoutHeap.empty && (m_timeoutHeap.front.timeout - now) / 10_000 <= 0) {
-			auto tm = m_timeoutHeap.front.id;
-			m_timeoutHeap.removeFront();
-
-			auto pt = tm in m_timers;
-			if (!pt || !pt.pending) continue;
-
-			Task owner = pt.owner;
-			auto callback = pt.callback;
-
-			if (pt.repeatDuration > 0) {
-				pt.timeout += pt.repeatDuration;
-				if (pt.timeout <= now) pt.timeout = now; // never try to process periodic timers faster than possible
-				m_timeoutHeap.insert(TimeoutEntry(pt.timeout, tm));
-			} else {
-				pt.pending = false;
-				releaseTimer(tm);
-			}
-
-			if (owner) m_core.resumeTask(owner);
+		auto now = Clock.currTime(UTC());
+		m_timers.consumeTimeouts(now, (timer, periodic, ref data) {
+			Task owner = data.owner;
+			auto callback = data.callback;
+			if (!periodic) releaseTimer(timer);
+			if (owner && owner.running) m_core.resumeTask(owner);
 			if (callback) runTask(callback);
-		}
+		});
 	}
 
 	void exitEventLoop()
@@ -234,9 +218,8 @@ class Win32EventDriver : EventDriver {
 		overlapped.InternalHigh = 0;
 		overlapped.hEvent = cast(HANDLE)cast(void*)&status;
 
-		void* aif;
-
 		version(none){ // Windows 8+
+			void* aif;
 			ADDRINFOEXW addr_hint;
 			ADDRINFOEXW* addr_ret;
 			addr_hint.ai_family = family;
@@ -302,14 +285,16 @@ class Win32EventDriver : EventDriver {
 		socketEnforce(listen(sock, 128) == 0,
 			"Failed to listen");
 
-		return new Win32TCPListener(this, sock, conn_callback);
+		// TODO: support TCPListenOptions.distribute
+
+		return new Win32TCPListener(this, sock, conn_callback, options);
 	}
 
-	UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
+	Win32UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
 	{
 		assert(m_tid == GetCurrentThreadId());
-		auto addr = resolveHost(bind_address);
-		addr.port = port;
+		/*auto addr = resolveHost(bind_address);
+		addr.port = port;*/
 
 		assert(false);
 	}
@@ -325,60 +310,39 @@ class Win32EventDriver : EventDriver {
 		assert(false, "Not implemented.");
 	}
 
-	size_t createTimer(void delegate() callback)
-	{
-		assert(m_tid == GetCurrentThreadId());
-		auto id = m_timerIDCounter++;
-		if (!id) id = m_timerIDCounter++;
-		m_timers[id] = TimerInfo(callback);
-		return id;
-	}
+	size_t createTimer(void delegate() callback) { return m_timers.create(TimerInfo(callback)); }
 
-	void acquireTimer(size_t timer_id) { m_timers[timer_id].refCount++; }
+	void acquireTimer(size_t timer_id) { m_timers.getUserData(timer_id).refCount++; }
 	void releaseTimer(size_t timer_id)
 	{
-		if (!--m_timers[timer_id].refCount)
-			m_timers.remove(timer_id);
+		if (!--m_timers.getUserData(timer_id).refCount)
+			m_timers.destroy(timer_id);
 	}
 
-	bool isTimerPending(size_t timer_id) { return m_timers[timer_id].pending; }
+	bool isTimerPending(size_t timer_id) { return m_timers.isPending(timer_id); }
 
 	void rearmTimer(size_t timer_id, Duration dur, bool periodic)
 	{
-		auto timeout = Clock.currStdTime() + dur.total!"hnsecs";
-		auto pt = timer_id in m_timers;
-		assert(pt !is null, "Accessing non-existent timer ID.");
-		pt.timeout = timeout;
-		pt.repeatDuration = periodic ? dur.total!"hnsecs" : 0;
-		if (!pt.pending) {
-			pt.pending = true;
+		if (!m_timers.isPending(timer_id))
 			acquireTimer(timer_id);
-		}
-		m_timeoutHeap.insert(TimeoutEntry(timeout, timer_id));
+		m_timers.schedule(timer_id, dur, periodic);
 	}
 
 	void stopTimer(size_t timer_id)
 	{
-		auto pt = timer_id in m_timers;
-		if (pt.pending) {
-			pt.pending = false;
+		if (m_timers.isPending(timer_id))
 			releaseTimer(timer_id);
-		}
+		m_timers.unschedule(timer_id);
 	}
 
 	void waitTimer(size_t timer_id)
 	{
 		while (true) {
-			{
-				auto pt = timer_id in m_timers;
-				if (!pt || !pt.pending) return;
-				assert(pt.owner == Task.init, "Waiting for the same timer from multiple tasks is not supported.");
-				pt.owner = Task.getThis();
-			}
-			scope (exit) {
-				auto pt = timer_id in m_timers;
-				if (pt) pt.owner = Task.init;
-			}
+			auto data = &m_timers.getUserData(timer_id);
+			assert(data.owner == Task.init, "Waiting for the same timer from multiple tasks is not supported.");
+			if (!m_timers.isPending(timer_id)) return;
+			data.owner = Task.getThis();
+			scope (exit) m_timers.getUserData(timer_id).owner = Task.init;
 			m_core.yieldForEvent();
 		}
 	}
@@ -399,7 +363,7 @@ class Win32EventDriver : EventDriver {
 		stat.finished = true;
 		if( stat.task )
 			try stat.driver.m_core.resumeTask(stat.task);
-			catch( Throwable th ) logWarn("Resuming task for DNS lookup has thrown: %s", th.msg);
+			catch (UncaughtException th) logWarn("Resuming task for DNS lookup has thrown: %s", th.msg);
 	}
 
 	private static nothrow extern(System)
@@ -416,7 +380,7 @@ class Win32EventDriver : EventDriver {
 					foreach( task, tid; lst )
 						if( tid is driver && task )
 							driver.m_core.resumeTask(task);
-				} catch(Throwable th){
+				} catch(UncaughtException th){
 					logWarn("Failed to resume signal listeners: %s", th.msg);
 					return 0;
 				}
@@ -441,19 +405,11 @@ interface SocketEventHandler {
 }
 
 private struct TimerInfo {
-	long timeout;
-	long repeatDuration;
 	size_t refCount = 1;
 	void delegate() callback;
 	Task owner;
-	bool pending;
 
 	this(void delegate() callback) { this.callback = callback; }
-}
-
-private struct TimeoutEntry {
-	long timeout;
-	size_t id;
 }
 
 
@@ -461,7 +417,7 @@ private struct TimeoutEntry {
 /* class Win32ManualEvent                                                     */
 /******************************************************************************/
 
-class Win32ManualEvent : ManualEvent {
+final class Win32ManualEvent : ManualEvent {
 	private {
 		core.sync.mutex.Mutex m_mutex;
 		Win32EventDriver m_driver;
@@ -479,7 +435,7 @@ class Win32ManualEvent : ManualEvent {
 
 	void emit()
 	{
-		auto newcnt = atomicOp!"+="(m_emitCount, 1);
+		/*auto newcnt =*/ atomicOp!"+="(m_emitCount, 1);
 		bool[Win32EventDriver] threads;
 		synchronized(m_mutex)
 		{
@@ -519,7 +475,7 @@ class Win32ManualEvent : ManualEvent {
 		m_waiter = Task.getThis();
 		auto timer = m_driver.createTimer(null);
 		scope(exit) m_driver.releaseTimer(timer);
-		m_driver.m_timers[timer].owner = Task.getThis();
+		m_driver.m_timers.getUserData(timer).owner = Task.getThis();
 		m_driver.rearmTimer(timer, timeout, false);
 		while (ec == reference_emit_count && !m_driver.isTimerPending(timer)) {
 			m_driver.m_core.yieldForEvent();
@@ -562,7 +518,7 @@ class Win32ManualEvent : ManualEvent {
 /* class Win32FileStream                                                      */
 /******************************************************************************/
 
-class Win32FileStream : FileStream {
+final class Win32FileStream : FileStream {
 	private {
 		Path m_path;
 		HANDLE m_handle;
@@ -579,7 +535,6 @@ class Win32FileStream : FileStream {
 		m_path = path;
 		m_mode = mode;
 		m_driver = driver;
-		auto nstr = m_path.toNativeString();
 
 		auto access = m_mode == FileMode.readWrite ? (GENERIC_WRITE | GENERIC_READ) :
 						(m_mode == FileMode.createTrunc || m_mode == FileMode.append)? GENERIC_WRITE : GENERIC_READ;
@@ -760,7 +715,7 @@ class Win32FileStream : FileStream {
 				if( dwError != 0 ) ex = new Exception("File I/O error: "~to!string(dwError));
 				if( fileStream.m_task ) fileStream.m_driver.resumeTask(fileStream.m_task, ex);
 			}
-		} catch( Throwable e ){
+		} catch( UncaughtException e ){
 			logWarn("Exception while handling file I/O: %s", e.msg);
 		}
 	}
@@ -771,7 +726,7 @@ class Win32FileStream : FileStream {
 /* class Win32Directory Watcher                                               */
 /******************************************************************************/
 
-class Win32DirectoryWatcher : DirectoryWatcher {
+final class Win32DirectoryWatcher : DirectoryWatcher {
 	private {
 		Path m_path;
 		bool m_recursive;
@@ -883,7 +838,7 @@ class Win32DirectoryWatcher : DirectoryWatcher {
 					if( dwError != 0 ) ex = new Exception("Diretory watcher error: "~to!string(dwError));
 					if( watcher.m_task ) watcher.m_core.resumeTask(watcher.m_task, ex);
 				}
-			} catch( Throwable th ){
+			} catch( UncaughtException th ){
 				logWarn("Exception in directory watcher callback: %s", th.msg);
 			}
 		}
@@ -895,7 +850,7 @@ class Win32DirectoryWatcher : DirectoryWatcher {
 /* class Win32UDPConnection                                                   */
 /******************************************************************************/
 
-class Win32UDPConnection : UDPConnection, SocketEventHandler {
+final class Win32UDPConnection : UDPConnection, SocketEventHandler {
 	private {
 		Task m_task;
 		Win32EventDriver m_driver;
@@ -983,8 +938,24 @@ class Win32UDPConnection : UDPConnection, SocketEventHandler {
 
 	ubyte[] recv(ubyte[] buf = null, NetworkAddress* peer_address = null)
 	{
+		return recv(Duration.max, buf, peer_address);
+	}
+
+	ubyte[] recv(Duration timeout, ubyte[] buf = null, NetworkAddress* peer_address = null)
+	{
+		size_t tm;
+		if (timeout != Duration.max && timeout > 0.seconds) {
+			tm = m_driver.createTimer(null);
+			m_driver.rearmTimer(tm, timeout, false);
+			m_driver.acquireTimer(tm);
+		}
+
 		acquire();
-		scope(exit) release();
+		scope(exit) {
+			release();
+			if (tm != size_t.max) m_driver.releaseTimer(tm);
+		}
+
 		assert(buf.length <= int.max);
 		if( buf.length == 0 ) buf.length = 65507;
 		NetworkAddress from;
@@ -1000,6 +971,10 @@ class Win32UDPConnection : UDPConnection, SocketEventHandler {
 				auto err = WSAGetLastError();
 				logDebug("UDP recv err: %s", err);
 				socketEnforce(err == WSAEWOULDBLOCK, "Error receiving UDP packet");
+
+				if (timeout != Duration.max) {
+					enforce(timeout > 0.seconds && m_driver.isTimerPending(tm), "UDP receive timeout.");
+				}
 			}
 			m_driver.m_core.yieldForEvent();
 		}
@@ -1019,7 +994,7 @@ class Win32UDPConnection : UDPConnection, SocketEventHandler {
 			auto f = ctx.task;
 			if( f && f.state != Fiber.State.TERM )
 				ctx.core.resumeTask(f);
-		} catch( Throwable e ){
+		} catch( UncaughtException e ){
 			logError("Exception onUDPRead: %s", e.msg);
 			debug assert(false);
 		}*/
@@ -1033,13 +1008,14 @@ class Win32UDPConnection : UDPConnection, SocketEventHandler {
 
 enum ConnectionStatus { Initialized, Connected, Disconnected }
 
-class Win32TCPConnection : TCPConnection, SocketEventHandler {
+final class Win32TCPConnection : TCPConnection, SocketEventHandler {
 	private {
 		Win32EventDriver m_driver;
 		Task m_readOwner;
 		Task m_writeOwner;
 		bool m_tcpNoDelay;
 		Duration m_readTimeout;
+		bool m_keepAlive;
 		SOCKET m_socket;
 		NetworkAddress m_localAddress;
 		NetworkAddress m_peerAddress;
@@ -1147,6 +1123,15 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 	}
 	@property Duration readTimeout() const { return m_readTimeout; }
 
+	@property void keepAlive(bool enabled)
+	{
+		m_keepAlive = enabled;
+		BOOL eni = enabled;
+		setsockopt(m_socket, SOL_SOCKET, SO_KEEPALIVE, &eni, eni.sizeof);
+		assert(false);
+	}
+	@property bool keepAlive() const { return m_keepAlive; }
+
 	@property bool connected() const { return m_status == ConnectionStatus.Connected; }
 
 	@property string peerAddress() const { return m_peerAddressString; }
@@ -1191,7 +1176,7 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 		scope(exit) releaseReader();
 		auto tm = m_driver.createTimer(null);
 		scope(exit) m_driver.releaseTimer(tm);
-		m_driver.m_timers[tm].owner = Task.getThis();
+		m_driver.m_timers.getUserData(tm).owner = Task.getThis();
 		m_driver.rearmTimer(tm, timeout, false);
 		while (m_readBuffer.empty) {
 			if (!connected) return false;
@@ -1327,7 +1312,11 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 	void notifySocketEvent(SOCKET sock, WORD event, WORD error)
 	nothrow {
 		try {
-			logDebug("Socket event for %s: %s, error: %s", sock, event, error);
+			logDebugV("Socket event for %s: %s, error: %s", sock, event, error);
+			if (m_socket == -1) {
+				logDebug("Event for already closed socket - ignoring");
+				return;
+			}
 			assert(sock == m_socket);
 			Exception ex;
 			switch(event){
@@ -1408,12 +1397,12 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 					if (m_writeOwner) m_driver.m_core.resumeTask(m_writeOwner, ex);
 					break;
 			}
-		} catch( Throwable th ){
+		} catch( UncaughtException th ){
 			logWarn("Exception while handling socket event: %s", th.msg);
 		}
 	}
 
-	private void runConnectionCallback()
+	private void runConnectionCallback(TCPListenOptions options)
 	{
 		try {
 			m_connectionCallback(this);
@@ -1421,8 +1410,9 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 		} catch( Exception e ){
 			logWarn("Handling of connection failed: %s", e.msg);
 			logDiagnostic("%s", e.toString());
+		} finally {
+			if (!(options & TCPListenOptions.disableAutoClose) && this.connected) close();
 		}
-		if( this.connected ) close();
 	}
 
 	private static extern(System) nothrow
@@ -1437,7 +1427,7 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 				if( dwError != 0 ) ex = new Exception("Socket I/O error: "~to!string(dwError));
 				conn.m_driver.m_core.resumeTask(conn.m_writeOwner, ex);
 			}
-		} catch( Throwable th ){
+		} catch( UncaughtException th ){
 			logWarn("Exception while handling TCP I/O: %s", th.msg);
 		}
 	}
@@ -1447,19 +1437,21 @@ class Win32TCPConnection : TCPConnection, SocketEventHandler {
 /* class Win32TCPListener                                                     */
 /******************************************************************************/
 
-class Win32TCPListener : TCPListener, SocketEventHandler {
+final class Win32TCPListener : TCPListener, SocketEventHandler {
 	private {
 		Win32EventDriver m_driver;
 		SOCKET m_socket;
 		void delegate(TCPConnection conn) m_connectionCallback;
+		TCPListenOptions m_options;
 	}
 
-	this(Win32EventDriver driver, SOCKET sock, void delegate(TCPConnection conn) conn_callback)
+	this(Win32EventDriver driver, SOCKET sock, void delegate(TCPConnection conn) conn_callback, TCPListenOptions options)
 	{
 		m_driver = driver;
 		m_socket = sock;
 		m_connectionCallback = conn_callback;
 		m_driver.m_socketHandlers[sock] = this;
+		m_options = options;
 
 		WSAAsyncSelect(sock, m_driver.m_hwnd, WM_USER_SOCKET, FD_ACCEPT);
 	}
@@ -1488,7 +1480,7 @@ class Win32TCPListener : TCPListener, SocketEventHandler {
 					// TODO avoid GC allocations for delegate and Win32TCPConnection
 					auto conn = new Win32TCPConnection(m_driver, clientsock, addr, ConnectionStatus.Connected);
 					conn.m_connectionCallback = m_connectionCallback;
-					runTask(&conn.runConnectionCallback);
+					runTask(&conn.runConnectionCallback, m_options);
 				} catch( Exception e ){
 					logWarn("Exception white accepting TCP connection: %s", e.msg);
 					try logDiagnostic("Exception white accepting TCP connection: %s", e.toString());
@@ -1505,7 +1497,6 @@ private {
 		enum clearValue = UINT_PTR.max;
 		static bool equals(UINT_PTR a, UINT_PTR b) { return a == b; }
 	}
-	HashMap!(UINT_PTR, void*/*Win32Timer*/, TimerMapTraits) s_timers;
 	__gshared s_setupWindowClass = false;
 }
 
@@ -1519,5 +1510,7 @@ void setupWindowClass()
 	s_setupWindowClass = true;
 }
 
+version (VibeDebugCatchAll) private alias UncaughtException = Throwable;
+else private alias UncaughtException = Exception;
 
 } // version(VibeWin32Driver)

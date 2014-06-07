@@ -25,6 +25,7 @@ import vibe.utils.array;
 import vibe.utils.memory;
 
 import core.exception : AssertError;
+import std.algorithm : splitter;
 import std.array;
 import std.conv;
 import std.encoding : sanitize;
@@ -134,12 +135,9 @@ unittest {
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use requestHTTP instead.") alias requestHttp = requestHTTP;
-
 
 /**
-	Returns a HttpClient proxy object that is connected to the specified host.
+	Returns a HTTPClient proxy object that is connected to the specified host.
 
 	Internally, a connection pool is used to reuse already existing connections. Note that
 	usually requestHTTP should be used for making requests instead of manually using a
@@ -171,9 +169,6 @@ auto connectHTTP(string host, ushort port = 0, bool ssl = false)
 	return pool.lockConnection();
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use connectHTTP instead.") alias connectHttp = connectHTTP;
-
 
 /**************************************************************************************************/
 /* Public types                                                                                   */
@@ -186,11 +181,8 @@ deprecated("Please use connectHTTP instead.") alias connectHttp = connectHTTP;
 	pool of HTTPClient instances to keep the number of connection establishments low while not
 	blocking requests from different tasks.
 */
-class HTTPClient {
+final class HTTPClient {
 	enum maxHeaderLineLength = 4096;
-
-	/// Deprecated compatibility alias
-	deprecated("Please use maxHeaderLineLength instead.") enum maxHttpHeaderLineLength = maxHeaderLineLength;
 
 	private {
 		string m_server;
@@ -231,10 +223,12 @@ class HTTPClient {
 		m_conn = null;
 		m_server = server;
 		m_port = port;
-		m_ssl = ssl ? new SSLContext(SSLContextKind.client) : null;
-		// this will be changed to trustedCert once a proper root CA store is available by default
-		m_ssl.peerValidationMode = SSLPeerValidationMode.none;
-		if (ms_sslSetup) ms_sslSetup(m_ssl);
+		if (ssl) {
+			m_ssl = createSSLContext(SSLContextKind.client);
+			// this will be changed to trustedCert once a proper root CA store is available by default
+			m_ssl.peerValidationMode = SSLPeerValidationMode.none;
+			if (ms_sslSetup) ms_sslSetup(m_ssl);
+		}
 	}
 
 	/**
@@ -245,8 +239,11 @@ class HTTPClient {
 	void disconnect()
 	{
 		if (m_conn) {
-			if (m_conn.connected) m_stream.finalize();
-			m_conn.close();
+			if (m_conn.connected) {
+				try m_stream.finalize();
+				catch (Exception e) logDebug("Failed to finalize connection stream when closing HTTP client connection: %s", e.msg);
+				m_conn.close();
+			}
 			if (m_stream !is m_conn) {
 				destroy(m_stream);
 				m_stream = null;
@@ -274,7 +271,7 @@ class HTTPClient {
 	void request(scope void delegate(scope HTTPClientRequest req) requester, scope void delegate(scope HTTPClientResponse) responder)
 	{
 		version (VibeManualMemoryManagement) {
-			scope request_allocator = new shared PoolAllocator(1024, defaultAllocator());
+			scope request_allocator = new PoolAllocator(1024, defaultAllocator());
 			scope(exit) request_allocator.reset();
 		} else auto request_allocator = defaultAllocator();
 
@@ -294,7 +291,7 @@ class HTTPClient {
 				user_exception = e;
 			}
 			if (user_exception || m_responding) {
-				logDebug("Failed to send a complete response to server - disconnecting.");
+				logDebug("Failed to handle the complete response of the server - disconnecting.");
 				res.disconnect();
 			}
 			assert(!m_responding, "Still in responding state after finalizing the response!?");
@@ -332,7 +329,7 @@ class HTTPClient {
 			if (m_conn) m_conn.close(); // make sure all resources are freed
 			m_conn = connectTCP(m_server, m_port);
 			m_stream = m_conn;
-			if (m_ssl) m_stream = new SSLStream(m_conn, m_ssl, SSLStreamState.connecting, m_server, m_conn.remoteAddress);
+			if (m_ssl) m_stream = createSSLStream(m_conn, m_ssl, SSLStreamState.connecting, m_server, m_conn.remoteAddress);
 
 			now = Clock.currTime(UTC());
 		}
@@ -352,9 +349,6 @@ class HTTPClient {
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPClient instead.") alias HttpClient = HTTPClient;
-
 
 /**
 	Represents a HTTP client request (as sent to the server).
@@ -368,7 +362,6 @@ final class HTTPClientRequest : HTTPRequest {
 	}
 
 	
-
 	/// private
 	this(Stream conn, NetworkAddress local_addr)
 	{
@@ -457,19 +450,23 @@ final class HTTPClientRequest : HTTPRequest {
 
 	private void writeHeader()
 	{
+		import vibe.stream.wrapper;
+
 		assert(!m_headerWritten, "HTTPClient tried to write headers twice.");
 		m_headerWritten = true;
 
-		formattedWrite(m_conn, "%s %s %s\r\n", httpMethodString(method), requestURL, getHTTPVersionString(httpVersion));
+		auto output = StreamOutputRange(m_conn);
+
+		formattedWrite(&output, "%s %s %s\r\n", httpMethodString(method), requestURL, getHTTPVersionString(httpVersion));
 		logTrace("--------------------");
 		logTrace("HTTP client request:");
 		logTrace("--------------------");
-		logTrace("%s %s %s", httpMethodString(method), requestURL, getHTTPVersionString(httpVersion));
+		logTrace("%s", this);
 		foreach( k, v; headers ){
-			formattedWrite(m_conn, "%s: %s\r\n", k, v);
+			formattedWrite(&output, "%s: %s\r\n", k, v);
 			logTrace("%s: %s", k, v);
 		}
-		m_conn.write("\r\n");
+		output.put("\r\n");
 		logTrace("--------------------");
 	}
 
@@ -498,9 +495,6 @@ final class HTTPClientRequest : HTTPRequest {
 	}
 }
 
-/// Deprecated compatibility alias
-deprecated("Please use HTTPClientRequest instead.") alias HttpClientRequest = HTTPClientRequest;
-
 
 /**
 	Represents a HTTP client response (as received from the server).
@@ -519,7 +513,7 @@ final class HTTPClientResponse : HTTPResponse {
 	}
 
 	/// private
-	this(HTTPClient client, bool has_body, bool close_conn, shared(Allocator) alloc = defaultAllocator())
+	this(HTTPClient client, bool has_body, bool close_conn, Allocator alloc = defaultAllocator())
 	{
 		m_client = client;
 		m_closeConn = close_conn;
@@ -546,20 +540,21 @@ final class HTTPClientResponse : HTTPResponse {
 		logTrace("---------------------");
 		logTrace("HTTP client response:");
 		logTrace("---------------------");
-		logTrace("%s %s", getHTTPVersionString(this.httpVersion), this.statusCode);
+		logTrace("%s", this);
 		foreach (k, v; this.headers)
 			logTrace("%s: %s", k, v);
 		logTrace("---------------------");
 
 		int max = 2;
 		if (auto pka = "Keep-Alive" in this.headers) {
-			foreach(s; split(*pka, ",")){
-				auto pair = s.split("=");
-				auto name = pair[0].strip();
+			foreach(s; splitter(*pka, ',')){
+				auto pair = s.splitter('=');
+				auto name = pair.front.strip();
+				pair.popFront();
 				if (icmp(name, "timeout") == 0) {
-					m_client.m_timeout = pair[1].to!int();
+					m_client.m_timeout = pair.front.to!int();
 				} else if (icmp(name, "max") == 0) {
-					max = pair[1].to!int();
+					max = pair.front.to!int();
 				}
 			}
 		}
@@ -641,9 +636,8 @@ final class HTTPClientResponse : HTTPResponse {
 		Reads the whole response body and tries to parse it as JSON.
 	*/
 	Json readJson(){
-		auto bdy = bodyReader.readAll();
-		auto str = cast(string)bdy;
-		return parseJson(str);
+		auto bdy = bodyReader.readAllUTF8();
+		return parseJson(bdy);
 	}
 
 	/**
@@ -697,9 +691,6 @@ final class HTTPClientResponse : HTTPResponse {
 		destroy(lockedConnection);
 	}
 }
-
-/// Deprecated compatibility alias
-deprecated("Please use HTTPClientResponse instead.") alias HttpClientResponse = HTTPClientResponse;
 
 
 private __gshared NullOutputStream s_sink;

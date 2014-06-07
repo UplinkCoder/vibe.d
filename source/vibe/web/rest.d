@@ -15,7 +15,7 @@ import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 import vibe.http.server : HTTPServerRequestDelegate;
 
-import std.array : startsWith, endsWith;
+import std.algorithm : startsWith, endsWith;
 
 /**
 	Registers a REST interface and connects it the the given instance.
@@ -132,7 +132,7 @@ void registerRestInterface(TImpl)(URLRouter router, TImpl instance, MethodStyle 
 	import vibe.internal.meta.traits : baseInterface;
 
 	alias I = baseInterface!TImpl;
-	enum uda = findFirstUDA!(RootPath, I);
+	enum uda = findFirstUDA!(RootPathAttribute, I);
 
 	static if (!uda.found)
 		registerRestInterface!I(router, instance, "/", style);
@@ -145,7 +145,6 @@ void registerRestInterface(TImpl)(URLRouter router, TImpl instance, MethodStyle 
 		}
 		else
 		{
-			auto path = uda.value.data;
 			registerRestInterface!I(
 				router,
 				instance,
@@ -169,10 +168,8 @@ unittest
 		// GET /api/greeting
 		@property string greeting();
 
-		version (none) {
-			// PUT /api/greeting
-			@property void greeting(string text);
-		}
+		// PUT /api/greeting
+		@property void greeting(string text);
 
 		// POST /api/users
 		@path("/users")
@@ -199,32 +196,14 @@ unittest
 			string[] m_users;
 		}
 		
-		@property string greeting()
-		{
-			return m_greeting;
-		}
+		@property string greeting() { return m_greeting; }
+		@property void greeting(string text) { m_greeting = text; }
 
-		version(none) {		
-			@property void greeting(string text)
-			{
-				m_greeting = text;
-			}
-		}
+		void addNewUser(string name) { m_users ~= name; }
 
-		void addNewUser(string name)
-		{
-			m_users ~= name;
-		}
+		@property string[] users() { return m_users; }
 
-		@property string[] users()
-		{
-			return m_users;
-		}
-
-		string getName(int id)
-		{
-			return m_users[id];
-		}
+		string getName(int id) { return m_users[id]; }
 
 		Json getSomeCustomJson()
 		{
@@ -260,9 +239,7 @@ class RestInterfaceClient(I) : I
 {
 	//pragma(msg, "imports for "~I.stringof~":");
 	//pragma(msg, generateModuleImports!(I)());
-#line 1 "module imports"
 	mixin(generateModuleImports!I());
-#line 255
 
 	import vibe.inet.url : URL, PathEntry;
 	import vibe.http.client : HTTPClientRequest;
@@ -283,7 +260,7 @@ class RestInterfaceClient(I) : I
 		import vibe.internal.meta.uda : findFirstUDA;
 		
 		URL url;
-		enum uda = findFirstUDA!(RootPath, I);
+		enum uda = findFirstUDA!(RootPathAttribute, I);
 		static if (!uda.found) {
 			url = URL.parse(base_url);
 		}
@@ -310,37 +287,30 @@ class RestInterfaceClient(I) : I
 		m_baseURL = base_url;
 		m_methodStyle = style;
 
-#line 1 "subinterface instances"
 		mixin (generateRestInterfaceSubInterfaceInstances!I());
-#line 305
 	}
 	
 	/**
 		An optional request filter that allows to modify each request before it is made.
 	*/
-	@property RequestFilter requestFilter()
+	final @property RequestFilter requestFilter()
 	{
 		return m_requestFilter;
 	}
 
 	/// ditto
-	@property void requestFilter(RequestFilter v) {
+	final @property void requestFilter(RequestFilter v) {
 		m_requestFilter = v;
-#line 1 "request filter"		
 		mixin (generateRestInterfaceSubInterfaceRequestFilter!I());
-#line 321
 	}
 	
 	//pragma(msg, "subinterfaces:");
 	//pragma(msg, generateRestInterfaceSubInterfaces!(I)());
-#line 1 "subinterfaces"
 	mixin (generateRestInterfaceSubInterfaces!I());
 	
 	//pragma(msg, "restinterface:");
 	//pragma(msg, generateRestInterfaceMethods!(I)());
-#line 1 "restinterface"
 	mixin (generateRestInterfaceMethods!I());
-#line 333 "source/vibe/http/rest.d"
 
 	protected {
 		import vibe.data.json : Json;
@@ -353,7 +323,7 @@ class RestInterfaceClient(I) : I
 			import vibe.http.common : HTTPStatusException, HTTPStatus,
 				httpMethodFromString, httpStatusText;
 			import vibe.inet.url : Path;
-			import std.string : appender;
+			import std.array : appender;
 
 			URL url = m_baseURL;
 
@@ -403,14 +373,8 @@ class RestInterfaceClient(I) : I
 					ret.toString()
 				);
 
-				if (res.statusCode != HTTPStatus.OK) {
-					if (ret.type == Json.Type.Object && ret.statusMessage.type == Json.Type.String) {
-						throw new HTTPStatusException(res.statusCode, ret.statusMessage.get!string);
-					}
-					else {
-						throw new HTTPStatusException(res.statusCode, httpStatusText(res.statusCode));
-					}
-				}
+				if (res.statusCode != HTTPStatus.OK)
+					throw new RestException(res.statusCode, ret);
 			};
 
 			requestHTTP(url, reqdg, resdg);
@@ -430,10 +394,8 @@ unittest
 
 		// GET /greeting
 		@property string greeting();
-		version(none) {
-			// PUT /greeting
-			@property void greeting(string text);
-		}
+		// PUT /greeting
+		@property void greeting(string text);
 		
 		// POST /new_user
 		void addNewUser(string name);
@@ -450,8 +412,7 @@ unittest
 		auto api = new RestInterfaceClient!IMyApi("http://127.0.0.1/api/");
 
 		logInfo("Status: %s", api.getStatus());
-		version(none)
-			api.greeting = "Hello, World!";
+		api.greeting = "Hello, World!";
 		logInfo("Greeting message: %s", api.greeting);
 		api.addNewUser("Peter");
 		api.addNewUser("Igor");

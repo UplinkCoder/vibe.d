@@ -1,0 +1,9 @@
+extends layout
+
+block head
+	- auto title = "Home";
+
+block contents
+
+	p& This is the internationalization example app.
+	p& It can use string interpolation! See the title "#{title}" here as an example.

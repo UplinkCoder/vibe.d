@@ -13,7 +13,7 @@ import std.exception : enforce;
 
 
 /**
-	Behaves similar to string[string] but the insertion order is not changed
+	Behaves similar to $(D VALUE[string]) but the insertion order is not changed
 	and multiple values per key are supported.
 
 	This kind of map is used for MIME headers (e.g. for HTTP, see
@@ -27,18 +27,39 @@ import std.exception : enforce;
 
 	Insertion and lookup has O(n) complexity.
 */
-struct DictionaryList(Value, bool case_sensitive = true) {
+struct DictionaryList(VALUE, bool case_sensitive = true, size_t NUM_STATIC_FIELDS = 32) {
+	import std.typecons : Tuple;
+
 	private {
-		static struct Field { uint keyCheckSum; string key; Value value; }
-		Field[64] m_fields;
+		static struct Field { uint keyCheckSum; string key; VALUE value; }
+		Field[NUM_STATIC_FIELDS] m_fields;
 		size_t m_fieldCount = 0;
 		Field[] m_extendedFields;
 		static char[256] s_keyBuffer;
 	}
 	
+	deprecated alias valueType = VALUE;
+	alias ValueType = VALUE;
+
+	struct FieldTuple { string key; ValueType value; }
+
 	/** The number of fields present in the map.
 	*/
 	@property size_t length() const { return m_fieldCount + m_extendedFields.length; }
+
+	/// Supports serialization using vibe.data.serialization.
+	static DictionaryList fromRepresentation(FieldTuple[] array)
+	{
+		DictionaryList ret;
+		foreach (ref v; array) ret.addField(v.key, v.value);
+		return ret;
+	}
+	/// ditto
+	FieldTuple[] toRepresentation() {
+		FieldTuple[] ret;
+		foreach (k, ref v; this) ret ~= FieldTuple(k, v);
+		return ret;
+	}
 
 	/** Removes the first field that matches the given key.
 	*/
@@ -83,7 +104,7 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 		have the same key, possibly resulting in duplicates. Use opIndexAssign
 		if you want to avoid duplicates.
 	*/
-	void addField(string key, Value value)
+	void addField(string key, ValueType value)
 	{
 		auto keysum = computeCheckSumI(key);
 		if (m_fieldCount < m_fields.length)
@@ -95,8 +116,8 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 
 		If no field is found, def_val is returned.
 	*/
-	Value get(string key, lazy Value def_val = Value.init)
-	const {
+	inout(ValueType) get(string key, lazy inout(ValueType) def_val = ValueType.init)
+	inout {
 		if (auto pv = key in this) return *pv;
 		return def_val;
 	}
@@ -105,15 +126,15 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 
 		Note that the version returning an array will allocate for each call.
 	*/
-	const(Value)[] getAll(string key)
+	const(ValueType)[] getAll(string key)
 	const {
 		import std.array;
-		auto ret = appender!(const(Value)[])();
+		auto ret = appender!(const(ValueType)[])();
 		getAll(key, (v) { ret.put(v); });
 		return ret.data;
 	}
 	/// ditto
-	void getAll(string key, scope void delegate(const(Value)) del)
+	void getAll(string key, scope void delegate(const(ValueType)) del)
 	const {
 		uint keysum = computeCheckSumI(key);
 		foreach (ref f; m_fields[0 .. m_fieldCount]) {
@@ -128,8 +149,8 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 
 	/** Returns the first value matching the given key.
 	*/
-	Value opIndex(string key)
-	const {
+	inout(ValueType) opIndex(string key)
+	inout {
 		auto pitm = key in this;
 		enforce(pitm !is null, "Accessing non-existent key '"~key~"'.");
 		return *pitm;
@@ -137,7 +158,7 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 	
 	/** Adds or replaces the given field with a new value.
 	*/
-	Value opIndexAssign(Value val, string key)
+	ValueType opIndexAssign(ValueType val, string key)
 	{
 		auto pitm = key in this;
 		if( pitm ) *pitm = val;
@@ -148,7 +169,7 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 
 	/** Returns a pointer to the first field that matches the given key.
 	*/
-	inout(Value)* opBinaryRight(string op)(string key) inout if(op == "in") {
+	inout(ValueType)* opBinaryRight(string op)(string key) inout if(op == "in") {
 		uint keysum = computeCheckSumI(key);
 		auto idx = getIndex(m_fields[0 .. m_fieldCount], key, keysum);
 		if( idx >= 0 ) return &m_fields[idx].value;
@@ -163,7 +184,7 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 
 	/** Iterates over all fields, including duplicates.
 	*/
-	int opApply(int delegate(ref string key, ref Value val) del)
+	int opApply(int delegate(ref string key, ref ValueType val) del)
 	{
 		foreach( ref kv; m_fields[0 .. m_fieldCount] ){
 			string kcopy = kv.key;
@@ -179,7 +200,7 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 	}
 
 	/// ditto
-	int opApply(int delegate(ref Value val) del)
+	int opApply(int delegate(ref ValueType val) del)
 	{
 		foreach( ref kv; m_fields[0 .. m_fieldCount] ){
 			if( auto ret = del(kv.value) )
@@ -192,15 +213,17 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 		return 0;
 	}
 
-	/** Duplicates the header map.
-	*/
-	@property DictionaryList dup()
-	const {
-		DictionaryList ret;
-		ret.m_fields[0 .. m_fieldCount] = m_fields[0 .. m_fieldCount];
-		ret.m_fieldCount = m_fieldCount;
-		ret.m_extendedFields = m_extendedFields.dup;
-		return ret;
+	static if (is(typeof({ const(ValueType) v; ValueType w; w = v; }))) {
+		/** Duplicates the header map.
+		*/
+		@property DictionaryList dup()
+		const {
+			DictionaryList ret;
+			ret.m_fields[0 .. m_fieldCount] = m_fields[0 .. m_fieldCount];
+			ret.m_fieldCount = m_fieldCount;
+			ret.m_extendedFields = m_extendedFields.dup;
+			return ret;
+		}
 	}
 
 	private ptrdiff_t getIndex(in Field[] map, string key, uint keysum)
@@ -221,10 +244,14 @@ struct DictionaryList(Value, bool case_sensitive = true) {
 	// very simple check sum function with a good chance to match
 	// strings with different case equal
 	private static uint computeCheckSumI(string s)
-	{
+	@trusted {
 		uint csum = 0;
-		static if (case_sensitive) foreach (char ch; s) csum += 357 * (csum + ch);
-		foreach (char ch; s) csum += 347 * (csum + (ch & 0x1101_1111));
+		immutable(char)* pc = s.ptr, pe = s.ptr + s.length;
+		for (; pc != pe; pc++) {
+			static if (case_sensitive) csum ^= *pc;
+			else csum ^= *pc & 0x1101_1111;
+			csum = (csum << 1) | (csum >> 31);
+		}
 		return csum;
 	}
 }
@@ -251,4 +278,18 @@ unittest {
 	b.addField("A", 2);
 	assert(b["A"] == 1);
 	assert(b.getAll("a") == [1, 2]);
+}
+
+unittest {
+	import vibe.data.json;
+	import vibe.data.serialization;
+
+	static assert(isCustomSerializable!(DictionaryList!int));
+
+	DictionaryList!(int, false) b;
+	b.addField("a", 1);
+	b.addField("A", 2);
+	auto app = appender!string();
+	serializeToJson(app, b);
+	assert(app.data == `[{"key":"a","value":1},{"key":"A","value":2}]`, app.data);
 }

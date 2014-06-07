@@ -4,13 +4,14 @@ import vibe.http.server;
 void handleRequest(HTTPServerRequest req, HTTPServerResponse res)
 {
 	string local_var = "Hello, World!";
+	bool is_admin = false;
 	res.headers["Content-Type"] = "text/html";
 	
-	auto output = res.bodyWriter();
-	//parseDietFile!("diet.dt", req, local_var)(output);
-	res.renderCompat!("diet.dt",
-		HTTPServerRequest, "req",
-		string, "local_var")(req, local_var);
+	res.render!("diet.dt", req, local_var, is_admin);
+	//res.renderCompat!("diet.dt",
+	//	HTTPServerRequest, "req",
+	//	string, "local_var",
+	//	bool, "is_admin")(req, local_var, is_admin);
 }
 
 shared static this()
