@@ -179,6 +179,18 @@ RootPathAttribute rootPath(string path)
 {
 	return RootPathAttribute(path);
 }
+
+/// private
+/**
+    UDA to defeine the ContentType for methods returning an InputStream or string
+    leaving it empty means "text/html"
+*/
+ContentTypeAttribute contentType(string data) {
+	if (!__ctfe)
+		assert(false);
+	return ContentTypeAttribute(data);
+}
+
 ///
 unittest
 {
@@ -259,7 +271,7 @@ struct PathAttribute
 	alias data this;
 }
 
-/// private
+/// private 
 deprecated alias OverriddenPath = PathAttribute;
 
 /// private
