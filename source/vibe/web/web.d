@@ -432,9 +432,13 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 	try {
 		static if (is(RET : vibe.data.json.Json)) {
 			res.writeJsonBody(__traits(getMember, instance, M)(params));
-		} else static if (is(RET : InputStream) || is(RET : string)) {
-			enum type = findFirstUDA!(ContentTypeAttribute,__traits(getMember, instance, M)).value;
-			res.writeBody(__traits(getMember, instance, M)(params),type);
+		} else static if (is(RET : InputStream) || is(RET : const ubyte[])) {
+			enum type = findFirstUDA!(ContentTypeAttribute,__traits(getMember, instance, M));
+			static if (type.found) {
+				res.writeBody(__traits(getMember, instance, M)(params),type.value);
+			} else {
+				res.writeBody(__traits(getMember, instance, M)(params));
+			}
 		} else {
 			static assert(is(RET == void), "Only InputStream, Json and void are supported as return types.");
 			__traits(getMember, instance, M)(params);

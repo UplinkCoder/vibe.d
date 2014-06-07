@@ -123,6 +123,16 @@ unittest
 
 
 /**
+    UDA to defeine the ContentType for methods returning an InputStream or string
+    leaving it empty means "text/plain"
+*/
+ContentTypeAttribute contentType(string data) {
+	if (!__ctfe)
+		assert(false);
+	return ContentTypeAttribute(data);
+}
+
+/**
 	User Defined Attribute interface to force specific HTTP method in REST interface
 	for function in question. Usual URL generation rules are still applied so if there
 	are any "get", "query" or similar prefixes, they are filtered out.
@@ -180,18 +190,8 @@ RootPathAttribute rootPath(string path)
 	return RootPathAttribute(path);
 }
 
-/// private
-/**
-    UDA to defeine the ContentType for methods returning an InputStream or string
-    leaving it empty means "text/html"
-*/
-ContentTypeAttribute contentType(string data) {
-	if (!__ctfe)
-		assert(false);
-	return ContentTypeAttribute(data);
-}
 
-///
+/// 
 unittest
 {
 	import vibe.http.router;
@@ -253,6 +253,11 @@ unittest
 	assert(routes[0].pattern == "/iapi/foo" && routes[0].method == HTTPMethod.GET);
 }
 
+/// private 
+struct ContentTypeAttribute {
+	string data;
+	alias data this;
+}
 
 /// private
 struct MethodAttribute
