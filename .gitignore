@@ -12,6 +12,7 @@
 /docs/styles
 
 .dub
+dub.userprefs
 
 # Unittest binaries
 vibe-d
