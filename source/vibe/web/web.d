@@ -406,6 +406,7 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 			else static if (is(PT == InputStream)) params[i] = req.bodyReader;
 			else static if (is(PT == HTTPServerRequest) || is(PT == HTTPRequest)) params[i] = req;
 			else static if (is(PT == HTTPServerResponse) || is(PT == HTTPResponse)) params[i] = res;
+			else static if (is(PT == WebSocketHandshakeDelegate)) params[i] = __traits(getMember, instance, M);
 			else static if (param_names[i].startsWith("_")) {
 				if (auto pv = param_names[i][1 .. $] in req.params) params[i] = (*pv).convTo!PT;
 				else static if (!is(default_values[i] == void)) params[i] = default_values[i];
@@ -414,10 +415,10 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 				params[i] = param_names[i] in req.form || param_names[i] in req.query;
 			} else {
 				static if (!is(default_values[i] == void)) {
-					if (!readParamRec(req, params[i], param_names[i], false))
+					if (!readParamRec(req, params[i], param_names[i], required.No))
 						params[i] = default_values[i];
 				} else {
-					readParamRec(req, params[i], param_names[i], true);
+					readParamRec(req, params[i], param_names[i], required.Yes);
 				}
 			}
 		} catch (Exception ex) {
