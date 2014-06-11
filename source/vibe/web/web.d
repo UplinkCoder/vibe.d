@@ -390,6 +390,8 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 	import std.array : startsWith;
 	import std.traits;
 	import vibe.data.json;
+	import vibe.http.websockets;
+
 	import vibe.internal.meta.uda : findFirstUDA;
 
 	alias RET = ReturnType!overload;
@@ -400,13 +402,13 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 
 	s_requestContext = RequestContext(req, res, determineLanguage!overload(req));
 	PARAMS params;
+
 	foreach (i, PT; PARAMS) {
 		try {
 			static if (param_names[i] == "_error" && ERROR.length == 1) params[i] = error[0];
 			else static if (is(PT == InputStream)) params[i] = req.bodyReader;
 			else static if (is(PT == HTTPServerRequest) || is(PT == HTTPRequest)) params[i] = req;
 			else static if (is(PT == HTTPServerResponse) || is(PT == HTTPResponse)) params[i] = res;
-			else static if (is(PT == WebSocketHandshakeDelegate)) params[i] = __traits(getMember, instance, M);
 			else static if (param_names[i].startsWith("_")) {
 				if (auto pv = param_names[i][1 .. $] in req.params) params[i] = (*pv).convTo!PT;
 				else static if (!is(default_values[i] == void)) params[i] = default_values[i];
@@ -415,10 +417,10 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 				params[i] = param_names[i] in req.form || param_names[i] in req.query;
 			} else {
 				static if (!is(default_values[i] == void)) {
-					if (!readParamRec(req, params[i], param_names[i], required.No))
+					if (!readParamRec(req, params[i], param_names[i], false))
 						params[i] = default_values[i];
 				} else {
-					readParamRec(req, params[i], param_names[i], required.Yes);
+					readParamRec(req, params[i], param_names[i], true);
 				}
 			}
 		} catch (Exception ex) {
@@ -441,6 +443,8 @@ private void handleRequest(string M, alias overload, C, ERROR...)(HTTPServerRequ
 			} else {
 				res.writeBody(__traits(getMember, instance, M)(params));
 			}
+		} else static if (is(RET == WebSocketHandshakeDelegate)) {
+			handleWebSockets(__traits(getMember, instance, M)(params))(req,res);
 		} else {
 			static assert(is(RET == void), "Only InputStream, Json and void are supported as return types.");
 			__traits(getMember, instance, M)(params);
